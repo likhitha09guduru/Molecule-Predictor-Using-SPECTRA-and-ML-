@@ -1,0 +1,4 @@
+compound_id,smiles,has_ms,has_nmr,has_ir
+C001,CCO,True,True,True
+C002,CC,True,True,True
+C003,c1ccccc1,True,True,True

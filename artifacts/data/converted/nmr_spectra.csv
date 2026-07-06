@@ -1,0 +1,4 @@
+compound_id,proton_peaks,carbon_peaks,solvent
+C001,"1.2:3:t,3.6:2:q","15.0,60.0",CDCl3
+C002,"0.8:3:t,1.2:2:q","10.0,20.0",CDCl3
+C003,7.3:5:m,"128.0,130.0",CDCl3

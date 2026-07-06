@@ -18,7 +18,7 @@ def get_requirements(file_path: str) -> List[str]:
     return requirements
 
 setup(
-    name='Molecule predictor usinf spectra and ml',
+    name='Molecule predictor using spectra and ml',
     version='0.0.1',
     author='Likhitha',
     author_email='likhitha09guduru@gmail.com',
