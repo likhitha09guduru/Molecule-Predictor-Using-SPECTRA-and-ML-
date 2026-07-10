@@ -3,11 +3,9 @@ Data Ingestion Module: Loads CSV files in chunks to prevent memory overflow.
 """
 import sys
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Optional, Union
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-import gc
 from src.logger import logging
 from src.exception import CustomException
 from src.utils import parse_peak_string, parse_nmr_peaks, validate_compound_id, ensure_directory
@@ -18,6 +16,8 @@ class DataIngestion:
         try:
             self.data_dir = Path(data_dir)
             ensure_directory(self.data_dir)
+            if chunk_size <= 0:
+                raise ValueError("chunk_size must be greater than zero")
             self.chunk_size = chunk_size
 
             # Storage dictionaries
