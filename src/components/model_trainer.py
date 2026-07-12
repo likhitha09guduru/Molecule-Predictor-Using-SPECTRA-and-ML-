@@ -75,8 +75,9 @@ class ModelTrainer:
                 weight_decay=weight_decay
             )
             
+            # ✅ Use HuberLoss for robustness to outliers
             if target_type == 'regression':
-                self.criterion = nn.MSELoss()
+                self.criterion = nn.HuberLoss(delta=1.0)
             else:
                 self.criterion = nn.CrossEntropyLoss()
             
@@ -108,6 +109,7 @@ class ModelTrainer:
             logging.info(f"  Learning rate: {learning_rate}")
             logging.info(f"  Max epochs: {epochs}")
             logging.info(f"  Target type: {target_type}")
+            logging.info(f"  Loss function: {'HuberLoss' if target_type == 'regression' else 'CrossEntropyLoss'}")
             logging.info(f"  Validation loader: {'✅ Available' if self.has_validation else '❌ None'}")
             logging.info("=" * 60)
             

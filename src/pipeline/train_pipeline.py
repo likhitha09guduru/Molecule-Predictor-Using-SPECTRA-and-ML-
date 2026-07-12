@@ -151,51 +151,88 @@ class TrainPipeline:
             logging.info(f"  Saved processed data to {self.run_dir / 'processed_data/'}")
             
             # ================================================================
-            # STEP 3: Data Transformation
+            # STEP 3: Load Labels (Molecular Weight)
             # ================================================================
             
-            logging.info("\n🔄 STEP 3: Data Transformation")
+            logging.info("\n📊 STEP 3: Loading Labels")
             logging.info("-" * 40)
             
-            # Load target values
-            targets_file = Path(self.config['data_dir']) / "ms_spectra.csv"
-            if not targets_file.exists():
-                raise CustomException(f"Target file not found: {targets_file}", sys)
+            # ✅ Load dedicated labels file
+            labels_file = Path(self.config['data_dir']) / "labels.csv"
             
-            targets_df = pd.read_csv(targets_file)
+            if not labels_file.exists():
+                error_msg = (
+                    f"❌ Labels file not found: {labels_file}\n"
+                    "   Please create labels.csv with the following format:\n"
+                    "   compound_id,molecular_weight\n"
+                    "   mol001,180.16\n"
+                    "   mol002,152.24\n"
+                    "   mol003,98.11"
+                )
+                logging.error(error_msg)
+                raise CustomException(error_msg, sys)
             
-            if 'target' not in targets_df.columns:
+            labels_df = pd.read_csv(labels_file)
+            
+            # ✅ Check required columns
+            if 'compound_id' not in labels_df.columns:
                 raise CustomException(
-                    f"No 'target' column found in {targets_file}. "
-                    "Please add a 'target' column with the property you want to predict.",
+                    f"❌ 'compound_id' column not found in {labels_file}",
                     sys
                 )
             
-            target_dict = dict(zip(targets_df['compound_id'], targets_df['target']))
-            logging.info(f"  Loaded {len(target_dict)} target values")
+            if 'molecular_weight' not in labels_df.columns:
+                raise CustomException(
+                    f"❌ 'molecular_weight' column not found in {labels_file}",
+                    sys
+                )
             
-            # Build target_values for each split
+            # ✅ Create target dictionary
+            target_dict = dict(zip(labels_df["compound_id"], labels_df["molecular_weight"]))
+            logging.info(f"  Loaded {len(target_dict)} molecular weight values from {labels_file}")
+            
+            # ================================================================
+            # STEP 4: Prepare Targets for Each Split
+            # ================================================================
+            
+            logging.info("\n🎯 STEP 4: Preparing Targets")
+            logging.info("-" * 40)
+            
             target_values = {}
             for split_name in ['train', 'validation', 'test']:
                 if split_name in processed_data and processed_data[split_name] is not None:
                     compound_ids = processed_data[split_name]['compound_ids']
                     targets = []
                     missing = []
+                    
                     for cid in compound_ids:
                         if cid in target_dict and pd.notna(target_dict[cid]):
                             targets.append(float(target_dict[cid]))
                         else:
                             missing.append(cid)
-                            targets.append(0.0)
                     
+                    # ✅ Raise exception for missing values (don't use 0.0)
                     if missing:
-                        logging.warning(f"Missing targets for {len(missing)} compounds in {split_name}")
+                        error_msg = (
+                            f"❌ Missing molecular weight for {len(missing)} compounds in {split_name} split:\n"
+                            f"   First 5 missing: {missing[:5]}\n"
+                            f"   Please ensure all compounds have molecular weight values in labels.csv"
+                        )
+                        logging.error(error_msg)
+                        raise CustomException(error_msg, sys)
                     
                     target_values[split_name] = targets
                     logging.info(f"  ✅ Loaded {len(targets)} targets for {split_name}")
                 else:
                     target_values[split_name] = None
                     logging.warning(f"  No data for {split_name} split")
+            
+            # ================================================================
+            # STEP 5: Data Transformation
+            # ================================================================
+            
+            logging.info("\n🔄 STEP 5: Data Transformation")
+            logging.info("-" * 40)
             
             transformer = DataTransformation(
                 batch_size=self.config['batch_size'],
@@ -214,20 +251,11 @@ class TrainPipeline:
                 output_dir=str(self.run_dir / 'dataloaders/')
             )
             
-            # ✅ Log what we have
-            logging.info(f"  DataLoaders created:")
-            for split_name in ['train', 'validation', 'test']:
-                loader = dataloaders.get(split_name)
-                if loader is not None:
-                    logging.info(f"    {split_name}: {len(loader.dataset)} samples")
-                else:
-                    logging.info(f"    {split_name}: None")
-            
             # ================================================================
-            # STEP 4: Model Creation
+            # STEP 6: Model Creation
             # ================================================================
             
-            logging.info("\n🤖 STEP 4: Model Creation")
+            logging.info("\n🤖 STEP 6: Model Creation")
             logging.info("-" * 40)
             
             model_config = {
@@ -247,17 +275,17 @@ class TrainPipeline:
             logging.info(f"  Model created with {model.count_parameters():,} parameters")
             
             # ================================================================
-            # STEP 5: Model Training
+            # STEP 7: Model Training (with HuberLoss)
             # ================================================================
             
-            logging.info("\n🏋️ STEP 5: Model Training")
+            logging.info("\n🏋️ STEP 7: Model Training")
             logging.info("-" * 40)
             
             trainer = ModelTrainer(
                 model=model,
                 train_loader=dataloaders['train'],
-                val_loader=dataloaders.get('validation'),  # ✅ This will be None if not available
-                test_loader=dataloaders.get('test'),       # ✅ This will be None if not available
+                val_loader=dataloaders.get('validation'),
+                test_loader=dataloaders.get('test'),
                 learning_rate=self.config['learning_rate'],
                 weight_decay=self.config['weight_decay'],
                 epochs=self.config['epochs'],
@@ -280,14 +308,12 @@ class TrainPipeline:
                     results['best_val_loss'] = min(valid_losses)
                     results['best_epoch'] = history['val_loss'].index(min(valid_losses)) + 1
                     logging.info(f"\n  ✅ Best validation loss: {results['best_val_loss']:.4f} at epoch {results['best_epoch']}")
-            else:
-                logging.info("\n  ✅ Training completed without validation")
             
             # ================================================================
-            # STEP 6: Save Final Model
+            # STEP 8: Save Final Model
             # ================================================================
             
-            logging.info("\n💾 STEP 6: Saving Final Model")
+            logging.info("\n💾 STEP 8: Saving Final Model")
             logging.info("-" * 40)
             
             final_model_path = self.run_dir / 'final_model.pt'
@@ -359,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
