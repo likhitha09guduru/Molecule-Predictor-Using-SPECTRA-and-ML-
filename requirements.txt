@@ -1,0 +1,10 @@
+numpy>=1.24.0
+pandas>=2.0.0
+torch>=2.2.0
+scikit-learn>=1.3.0
+matchms>=0.27.0
+rdkit>=2023.9.5
+jcamp>=1.2.2
+tqdm>=4.66.0
+setuptools>=68.0.0
+-e .
