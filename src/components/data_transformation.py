@@ -184,11 +184,24 @@ class DataTransformation:
         
         Returns:
             Dictionary with 'train', 'validation', 'test' DataLoaders
+        
+        Raises:
+            CustomException: If no targets are provided and no target_values are given
         """
         try:
             logging.info("\n" + "=" * 60)
             logging.info("CREATING DATALOADERS")
             logging.info("=" * 60)
+            
+            # ✅ Check if targets are provided
+            if target_values is None:
+                error_msg = (
+                    "❌ No target values provided!\n"
+                    "   Please provide target_values as a dictionary mapping split_name -> list of target values.\n"
+                    "   Example: target_values = {'train': [0.5, 1.2, ...], 'validation': [0.8, ...]}"
+                )
+                logging.error(error_msg)
+                raise CustomException(error_msg, sys)
             
             dataloaders = {}
             
@@ -200,21 +213,30 @@ class DataTransformation:
                 
                 data = processed_data[split_name]
                 compound_ids = data.get('compound_ids', [])
+                num_samples = len(compound_ids)
                 
-                # Get target values for this split
-                targets = None
-                if target_values is not None and split_name in target_values:
-                    targets = np.array(target_values[split_name], dtype=np.float32)
-                    logging.info(f"  Using provided targets for {split_name}: {len(targets)} samples")
-                else:
-                    # Create dummy targets (for testing)
-                    num_samples = len(compound_ids)
-                    if self.target_type == 'regression':
-                        targets = np.random.uniform(0, 10, size=num_samples).astype(np.float32)
-                        logging.warning(f"  No targets provided for {split_name}. Using random targets (testing only).")
-                    else:
-                        targets = np.random.randint(0, 5, size=num_samples)
-                        logging.warning(f"  No targets provided for {split_name}. Using random classes (testing only).")
+                # ✅ Get target values for this split
+                if split_name not in target_values:
+                    error_msg = (
+                        f"❌ No targets provided for {split_name} split!\n"
+                        f"   Expected {num_samples} targets for {split_name}.\n"
+                        f"   Available splits in target_values: {list(target_values.keys())}"
+                    )
+                    logging.error(error_msg)
+                    raise CustomException(error_msg, sys)
+                
+                targets_array = target_values[split_name]
+                if len(targets_array) != num_samples:
+                    error_msg = (
+                        f"❌ Target count mismatch for {split_name} split!\n"
+                        f"   Expected: {num_samples} targets (matches {len(compound_ids)} compounds)\n"
+                        f"   Got: {len(targets_array)} targets"
+                    )
+                    logging.error(error_msg)
+                    raise CustomException(error_msg, sys)
+                
+                targets = np.array(targets_array, dtype=np.float32)
+                logging.info(f"  Using provided targets for {split_name}: {len(targets)} samples")
                 
                 # Create dataset
                 dataset = SpectralDataset(
@@ -408,7 +430,18 @@ if __name__ == "__main__":
             num_workers=0
         )
         
-        dataloaders = transformer.create_dataloaders(processed_data)
+        # ✅ Pass target_values to avoid random data
+        # For testing without real targets, create dummy targets
+        dummy_targets = {}
+        for split_name in ['train', 'validation', 'test']:
+            if split_name in processed_data and processed_data[split_name] is not None:
+                num_samples = len(processed_data[split_name]['compound_ids'])
+                dummy_targets[split_name] = np.random.uniform(0, 10, num_samples).tolist()
+        
+        dataloaders = transformer.create_dataloaders(
+            processed_data,
+            target_values=dummy_targets  # ← Pass targets to avoid error
+        )
         
         # Step 4: Show statistics
         print("\n📊 DATALOADER STATISTICS:")
