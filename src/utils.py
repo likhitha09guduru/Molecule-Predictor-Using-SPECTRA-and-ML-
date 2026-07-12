@@ -248,16 +248,17 @@ def ensure_directory(path: Union[str, Path]) -> Path:
 def save_json(data: dict, file_path: Union[str, Path]) -> None:
     """
     Save data as JSON file.
-    
+
     Args:
         data: Dictionary to save
         file_path: Path to save the JSON file
     """
-    file_path = Path(file_path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(file_path, 'w') as f:
-        json.dump(data, f, indent=4)
+    try:
+        file_path = Path(file_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
+    except Exception as e:
+        raise CustomException(e, sys)
 
 def load_json(file_path: Union[str, Path]) -> dict:
     """

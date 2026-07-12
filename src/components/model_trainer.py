@@ -4,6 +4,7 @@ model_trainer.py - Training loop for multi-modal spectral model.
 import sys
 import json
 import time
+from sklearn.feature_selection import f_regression
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -229,8 +230,11 @@ class ModelTrainer:
                 self.optimizer.zero_grad()
                 outputs = self.model(ms, nmr, ir)
                 
+                # Handle output shape for loss computation
                 if self.target_type == 'regression':
-                    loss = self.criterion(outputs.squeeze(), targets)
+                    if outputs.dim() > 1 and outputs.size(-1) == 1:
+                        outputs = outputs.squeeze(-1)
+                    loss = self.criterion(outputs, targets)
                 else:
                     loss = self.criterion(outputs, targets)
                 
@@ -242,14 +246,23 @@ class ModelTrainer:
                 self.optimizer.step()
                 
                 total_loss += loss.item()
-                all_targets.extend(targets.cpu().numpy())
+                all_targets.extend(targets.detach().cpu().numpy())
                 all_preds.extend(outputs.detach().cpu().numpy())
                 
                 if batch_idx % self.log_interval == 0:
                     logging.info(f"  Epoch {epoch} | Batch {batch_idx}/{len(self.train_loader)} | Loss: {loss.item():.4f}")
             
             avg_loss = total_loss / len(self.train_loader)
-            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            # Convert to numpy arrays
+            all_targets = np.array(all_targets)
+            all_preds = np.array(all_preds)
+            
+            # Ensure predictions have correct shape
+            if self.target_type == 'regression' and all_preds.ndim > 1:
+                all_preds = all_preds.squeeze()
+            
+            metrics = self._compute_metrics(all_targets, all_preds)
             
             return avg_loss, metrics
             
@@ -272,17 +285,29 @@ class ModelTrainer:
                     
                     outputs = self.model(ms, nmr, ir)
                     
+                    # Handle output shape for loss computation
                     if self.target_type == 'regression':
-                        loss = self.criterion(outputs.squeeze(), targets)
+                        if outputs.dim() > 1 and outputs.size(-1) == 1:
+                            outputs = outputs.squeeze(-1)
+                        loss = self.criterion(outputs, targets)
                     else:
                         loss = self.criterion(outputs, targets)
                     
                     total_loss += loss.item()
-                    all_targets.extend(targets.cpu().numpy())
+                    all_targets.extend(targets.detach().cpu().numpy())
                     all_preds.extend(outputs.detach().cpu().numpy())
             
             avg_loss = total_loss / len(self.val_loader)
-            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            # Convert to numpy arrays
+            all_targets = np.array(all_targets)
+            all_preds = np.array(all_preds)
+            
+            # Ensure predictions have correct shape
+            if self.target_type == 'regression' and all_preds.ndim > 1:
+                all_preds = all_preds.squeeze()
+            
+            metrics = self._compute_metrics(all_targets, all_preds)
             
             return avg_loss, metrics
             
@@ -305,17 +330,29 @@ class ModelTrainer:
                     
                     outputs = self.model(ms, nmr, ir)
                     
+                    # Handle output shape for loss computation
                     if self.target_type == 'regression':
-                        loss = self.criterion(outputs.squeeze(), targets)
+                        if outputs.dim() > 1 and outputs.size(-1) == 1:
+                            outputs = outputs.squeeze(-1)
+                        loss = self.criterion(outputs, targets)
                     else:
                         loss = self.criterion(outputs, targets)
                     
                     total_loss += loss.item()
-                    all_targets.extend(targets.cpu().numpy())
+                    all_targets.extend(targets.detach().cpu().numpy())
                     all_preds.extend(outputs.detach().cpu().numpy())
             
             avg_loss = total_loss / len(dataloader)
-            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            # Convert to numpy arrays
+            all_targets = np.array(all_targets)
+            all_preds = np.array(all_preds)
+            
+            # Ensure predictions have correct shape
+            if self.target_type == 'regression' and all_preds.ndim > 1:
+                all_preds = all_preds.squeeze()
+            
+            metrics = self._compute_metrics(all_targets, all_preds)
             
             return avg_loss, metrics
             
@@ -326,7 +363,18 @@ class ModelTrainer:
         try:
             metrics = {}
             
+            # Ensure predictions have correct shape
+            if predictions.ndim > 1 and predictions.shape[1] == 1:
+                predictions = predictions.squeeze(-1)
+            
             if self.target_type == 'regression':
+                # Ensure both are 1D arrays
+                if targets.ndim > 1:
+                    targets = targets.squeeze()
+                if predictions.ndim > 1:
+                    predictions = predictions.squeeze()
+                
+                # Calculate metrics
                 mse = np.mean((targets - predictions) ** 2)
                 mae = np.mean(np.abs(targets - predictions))
                 rmse = np.sqrt(mse)
@@ -335,10 +383,23 @@ class ModelTrainer:
                 ss_tot = np.sum((targets - np.mean(targets)) ** 2)
                 r2 = 1 - (ss_res / (ss_tot + 1e-8))
                 
-                metrics = {'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2}
+                metrics = {
+                    'mse': float(mse),
+                    'mae': float(mae),
+                    'rmse': float(rmse),
+                    'r2': float(r2)
+                }
+                
             else:
-                pred_classes = np.argmax(predictions, axis=1)
-                metrics['accuracy'] = np.mean(pred_classes == targets)
+                # Classification metrics
+                if predictions.ndim > 1:
+                    pred_classes = np.argmax(predictions, axis=1)
+                else:
+                    pred_classes = predictions
+                
+                metrics = {
+                    'accuracy': float(np.mean(pred_classes == targets))
+                }
             
             return metrics
             
@@ -380,7 +441,11 @@ class ModelTrainer:
         try:
             best_path = self.run_dir / "best_model.pt"
             if best_path.exists():
-                checkpoint = torch.load(best_path, map_location=self.device)
+                checkpoint = torch.load(
+                    best_path,
+                    map_location=self.device,
+                    weights_only=False
+                )
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 logging.info(f"✅ Loaded best model from {best_path}")
             else:
@@ -394,7 +459,12 @@ class ModelTrainer:
             for key, value in self.history.items():
                 if isinstance(value, list) and len(value) > 0:
                     if isinstance(value[0], dict):
-                        history_serializable[key] = [str(v) for v in value]
+                        # Convert dict metrics to serializable format
+                        history_serializable[key] = [
+                            {k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
+                             for k, v in item.items()} 
+                            for item in value
+                        ]
                     else:
                         history_serializable[key] = value
                 else:
@@ -423,14 +493,12 @@ class ModelTrainer:
             if train_metrics:
                 log_msg += "\n  Train Metrics:"
                 for name, value in train_metrics.items():
-                    if name not in ['mse', 'mae', 'rmse']:
-                        log_msg += f" {name}: {value:.4f}"
+                    log_msg += f" {name}: {value:.4f}"
             
             if val_metrics and self.has_validation:
                 log_msg += "\n  Val Metrics:"
                 for name, value in val_metrics.items():
-                    if name not in ['mse', 'mae', 'rmse']:
-                        log_msg += f" {name}: {value:.4f}"
+                    log_msg += f" {name}: {value:.4f}"
             
             log_msg += f"\n  LR: {self.optimizer.param_groups[0]['lr']:.6f}"
             
