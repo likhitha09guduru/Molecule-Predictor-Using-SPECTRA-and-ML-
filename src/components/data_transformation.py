@@ -5,7 +5,7 @@ import sys
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 import json
 
@@ -99,20 +99,37 @@ class DataTransformation:
                            target_values: Optional[Dict] = None) -> Dict[str, DataLoader]:
         """
         Create DataLoaders for train, validation, and test splits.
+        
+        Args:
+            processed_data: Output from SpectralPreprocessor.create_dataset()
+            target_values: Dictionary mapping split_name -> list of target values
+        
+        Returns:
+            Dictionary with 'train', 'validation', 'test' DataLoaders
+        
+        Raises:
+            CustomException: If no targets are provided
         """
         try:
             logging.info("\n" + "=" * 60)
             logging.info("CREATING DATALOADERS")
             logging.info("=" * 60)
             
-            # ✅ If no target_values provided, create dummy targets
+            # ✅ REQUIRED: Check if targets are provided
             if target_values is None:
-                logging.warning("No target values provided. Creating dummy targets for testing.")
-                target_values = {}
-                for split_name in ['train', 'validation', 'test']:
-                    if split_name in processed_data and processed_data[split_name] is not None:
-                        num_samples = len(processed_data[split_name]['compound_ids'])
-                        target_values[split_name] = np.random.uniform(0, 10, num_samples).tolist()
+                error_msg = (
+                    "❌ FATAL: No target values provided!\n"
+                    "   target_values parameter is required.\n"
+                    "   Please provide target_values as a dictionary:\n"
+                    "   target_values = {\n"
+                    "       'train': [0.5, 1.2, 0.8, ...],\n"
+                    "       'validation': [0.6, 1.1, ...],\n"
+                    "       'test': [0.7, 0.9, ...]\n"
+                    "   }\n"
+                    "   The number of targets must match the number of compounds in each split."
+                )
+                logging.error(error_msg)
+                raise CustomException(error_msg, sys)
             
             dataloaders = {}
             
@@ -126,19 +143,32 @@ class DataTransformation:
                 compound_ids = data.get('compound_ids', [])
                 num_samples = len(compound_ids)
                 
-                # ✅ Get target values for this split
-                if split_name in target_values and target_values[split_name] is not None:
-                    targets_array = target_values[split_name]
-                    if len(targets_array) != num_samples:
-                        logging.warning(f"Target count mismatch for {split_name}: got {len(targets_array)}, expected {num_samples}")
-                        # ✅ Create dummy targets if mismatch
-                        targets_array = np.random.uniform(0, 10, num_samples).tolist()
-                    targets = np.array(targets_array, dtype=np.float32)
-                    logging.info(f"  Using provided targets for {split_name}: {len(targets)} samples")
-                else:
-                    # ✅ Create dummy targets if not provided
-                    logging.warning(f"No targets provided for {split_name}. Using dummy targets.")
-                    targets = np.random.uniform(0, 10, num_samples).astype(np.float32)
+                # ✅ REQUIRED: Check if targets exist for this split
+                if split_name not in target_values or target_values[split_name] is None:
+                    error_msg = (
+                        f"❌ FATAL: No targets provided for {split_name} split!\n"
+                        f"   Expected {num_samples} targets for {split_name}.\n"
+                        f"   Available splits in target_values: {list(target_values.keys())}\n"
+                        f"   Please add targets for '{split_name}' split."
+                    )
+                    logging.error(error_msg)
+                    raise CustomException(error_msg, sys)
+                
+                targets_array = target_values[split_name]
+                
+                # ✅ REQUIRED: Check if target count matches compound count
+                if len(targets_array) != num_samples:
+                    error_msg = (
+                        f"❌ FATAL: Target count mismatch for {split_name} split!\n"
+                        f"   Number of compounds: {num_samples}\n"
+                        f"   Number of targets: {len(targets_array)}\n"
+                        f"   These must match. Please check your target values."
+                    )
+                    logging.error(error_msg)
+                    raise CustomException(error_msg, sys)
+                
+                targets = np.array(targets_array, dtype=np.float32)
+                logging.info(f"  ✅ Using provided targets for {split_name}: {len(targets)} samples")
                 
                 # Create dataset
                 dataset = SpectralDataset(
@@ -165,7 +195,7 @@ class DataTransformation:
                 logging.info(f"  {split_name}: {len(dataset)} samples, {len(dataloader)} batches")
             
             logging.info("\n" + "=" * 60)
-            logging.info("DATALOADERS CREATED SUCCESSFULLY!")
+            logging.info("✅ DATALOADERS CREATED SUCCESSFULLY!")
             logging.info("=" * 60)
             
             return dataloaders
