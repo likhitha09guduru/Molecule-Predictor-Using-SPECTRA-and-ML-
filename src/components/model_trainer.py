@@ -163,8 +163,6 @@ class ModelTrainer:
             logging.info(f"  Max epochs: {epochs}")
             logging.info(f"  Early stopping patience: {early_stopping_patience}")
             logging.info(f"  Target type: {target_type}")
-            if hasattr(self.model, 'count_parameters'):
-                logging.info(f"  Model parameters: {self.model.count_parameters():,}")
             logging.info(f"  Checkpoint dir: {self.run_dir}")
             logging.info("=" * 60)
             
@@ -334,7 +332,9 @@ class ModelTrainer:
             (average_loss, metrics_dict)
         """
         try:
+            # ✅ FIX: Check if val_loader is None
             if self.val_loader is None:
+                logging.warning("No validation loader provided. Skipping validation.")
                 return 0.0, {}
             
             self.model.eval()
