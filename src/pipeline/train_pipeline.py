@@ -20,6 +20,7 @@ python -m src.pipeline.train_pipeline
 import sys
 import os
 import json
+import pandas as pd
 from pathlib import Path
 import argparse
 from datetime import datetime
@@ -241,14 +242,67 @@ class TrainPipeline:
             logging.info(f"  Saved processed data to {self.run_dir / 'processed_data/'}")
             
             # =================================================================
-            # STEP 3: Data Transformation (DataLoaders)
+            # STEP 3: Data Transformation (DataLoaders) - ✅ FIXED
             # =================================================================
             
             logging.info("\n🔄 STEP 3: Data Transformation")
             logging.info("-" * 40)
             
-            # ✅ CORRECTED: Pass None for target_values (uses real data)
-            # The DataTransformation class will look for target values in the CSV data
+            # ✅ READ REAL TARGETS FROM YOUR CSV
+            # Load your CSV with target values
+            targets_file = Path(self.config['data_dir']) / "ms_spectra.csv"
+            if not targets_file.exists():
+                error_msg = (
+                    f"❌ Target file not found: {targets_file}\n"
+                    "   Please ensure your CSV files have a 'target' column."
+                )
+                logging.error(error_msg)
+                raise CustomException(error_msg, sys)
+            
+            targets_df = pd.read_csv(targets_file)
+            
+            # Check if 'target' column exists
+            if 'target' not in targets_df.columns:
+                error_msg = (
+                    f"❌ No 'target' column found in {targets_file}\n"
+                    "   Please add a 'target' column with the property you want to predict."
+                )
+                logging.error(error_msg)
+                raise CustomException(error_msg, sys)
+            
+            # Create dictionary: compound_id -> target value
+            target_dict = dict(zip(targets_df['compound_id'], targets_df['target']))
+            logging.info(f"  Loaded {len(target_dict)} target values from CSV")
+            
+            # Build target_values for each split
+            target_values = {}
+            for split_name in ['train', 'validation', 'test']:
+                if split_name in processed_data and processed_data[split_name] is not None:
+                    compound_ids = processed_data[split_name]['compound_ids']
+                    targets = []
+                    missing = []
+                    for cid in compound_ids:
+                        if cid in target_dict:
+                            targets.append(float(target_dict[cid]))
+                        else:
+                            missing.append(cid)
+                            targets.append(None)
+                    
+                    if missing:
+                        error_msg = (
+                            f"❌ Missing target values for {len(missing)} compounds in {split_name} split.\n"
+                            f"   First 5 missing: {missing[:5]}\n"
+                            f"   Please ensure all compounds have target values in your CSV."
+                        )
+                        logging.error(error_msg)
+                        raise CustomException(error_msg, sys)
+                    
+                    target_values[split_name] = targets
+                    logging.info(f"  ✅ Loaded {len(targets)} targets for {split_name}")
+                else:
+                    target_values[split_name] = None
+            
+            # Create transformer
             transformer = DataTransformation(
                 batch_size=self.config['batch_size'],
                 shuffle_train=self.config['shuffle_train'],
@@ -256,9 +310,10 @@ class TrainPipeline:
                 target_type=self.config['target_type']
             )
             
+            # Create dataloaders with REAL targets
             dataloaders = transformer.create_dataloaders(
                 processed_data,
-                target_values=None  # ← Use REAL data, no random targets!
+                target_values=target_values  # ✅ REAL targets from CSV
             )
             
             # Save dataloader statistics

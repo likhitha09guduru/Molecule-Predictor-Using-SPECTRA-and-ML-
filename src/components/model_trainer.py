@@ -131,13 +131,12 @@ class ModelTrainer:
             else:
                 self.criterion = nn.CrossEntropyLoss()
             
-            # Setup learning rate scheduler
+            # ✅ FIXED: Removed verbose parameter
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
                 patience=scheduler_patience,
-                factor=scheduler_factor,
-                verbose=True
+                factor=scheduler_factor
             )
             
             # Training history
@@ -164,6 +163,8 @@ class ModelTrainer:
             logging.info(f"  Max epochs: {epochs}")
             logging.info(f"  Early stopping patience: {early_stopping_patience}")
             logging.info(f"  Target type: {target_type}")
+            if hasattr(self.model, 'count_parameters'):
+                logging.info(f"  Model parameters: {self.model.count_parameters():,}")
             logging.info(f"  Checkpoint dir: {self.run_dir}")
             logging.info("=" * 60)
             
@@ -633,7 +634,7 @@ def run_training_pipeline(
 
 
 # ============================================================================
-# TESTING (Uses REAL data only - no random targets)
+# TESTING
 # ============================================================================
 
 if __name__ == "__main__":
@@ -668,29 +669,23 @@ if __name__ == "__main__":
         transformer = DataTransformation(
             batch_size=4,  # Small batch for testing
             shuffle_train=True,
-            num_workers=0
+            num_workers=0,
+            target_type='regression'
         )
         
-        # ✅ CORRECT: Pass None as target_values - DataTransformation will handle it
-        # The DataTransformation expects targets to be provided separately
-        # For testing without real targets, we need to pass None
+        # Create dummy targets for testing
+        dummy_targets = {}
+        for split_name in ['train', 'validation', 'test']:
+            if split_name in processed_data and processed_data[split_name] is not None:
+                num_samples = len(processed_data[split_name]['compound_ids'])
+                dummy_targets[split_name] = np.random.uniform(0, 10, num_samples).tolist()
+        
         dataloaders = transformer.create_dataloaders(
             processed_data,
-            target_values=None  # ← No random targets!
+            target_values=dummy_targets
         )
         
-        print("\n✅ Data loaded successfully!")
-        
-        # Step 2: Check if dataloaders have targets
-        if dataloaders.get('train') is not None:
-            batch = next(iter(dataloaders['train']))
-            if 'target' not in batch:
-                print("\n⚠️ Warning: No target values found in data.")
-                print("   Please ensure your CSV files contain target values.")
-                print("   For testing, you can add a 'target' column to your CSVs.")
-                sys.exit(1)
-        
-        # Step 3: Create model
+        # Step 2: Create model
         print("\n🤖 Creating model...")
         model = MultiModalSpectraModel(
             hidden_dim=32,  # Small for testing
@@ -699,14 +694,12 @@ if __name__ == "__main__":
             fusion_type='concat'
         )
         
-        print(f"   Model created with {model.count_parameters():,} parameters")
-        
-        # Step 4: Train
+        # Step 3: Train
         print("\n🏋️ Training model (5 epochs for testing)...")
         trainer = ModelTrainer(
             model=model,
             train_loader=dataloaders['train'],
-            val_loader=dataloaders.get('validation'),
+            val_loader=dataloaders['validation'],
             epochs=5,
             learning_rate=0.01,
             log_interval=2,
