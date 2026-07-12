@@ -1,4 +1,21 @@
-compound_id,molecular_weight
-C001,46.07
-C002,30.07
-C003,78.11
+compound_id,molecule_name,molecular_weight
+C001,Methanol,32.04
+C002,Ethanol,46.07
+C003,Acetone,58.08
+C004,Benzene,78.11
+C005,Toluene,92.14
+C006,Phenol,94.11
+C007,Acetic Acid,60.05
+C008,Formic Acid,46.03
+C009,Aniline,93.13
+C010,Cyclohexane,84.16
+C011,Hexane,86.18
+C012,Heptane,100.2
+C013,Octane,114.23
+C014,Propanol,60.1
+C015,Butanol,74.12
+C016,Ethyl Acetate,88.11
+C017,Acetonitrile,41.05
+C018,Dimethyl Sulfoxide,78.13
+C019,Chloroform,119.38
+C020,Carbon Tetrachloride,153.82
