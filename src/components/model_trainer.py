@@ -14,14 +14,14 @@ OUTPUT: Trained model weights, training history, saved checkpoints
 """
 import sys
 import os
+import json
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
-import json
-import time
 from datetime import datetime
 import numpy as np
 
@@ -164,7 +164,6 @@ class ModelTrainer:
             logging.info(f"  Max epochs: {epochs}")
             logging.info(f"  Early stopping patience: {early_stopping_patience}")
             logging.info(f"  Target type: {target_type}")
-            logging.info(f"  Model parameters: {model.count_parameters():,}")
             logging.info(f"  Checkpoint dir: {self.run_dir}")
             logging.info("=" * 60)
             
@@ -634,7 +633,7 @@ def run_training_pipeline(
 
 
 # ============================================================================
-# TESTING
+# TESTING (Uses REAL data only - no random targets)
 # ============================================================================
 
 if __name__ == "__main__":
@@ -649,7 +648,7 @@ if __name__ == "__main__":
         from src.components.model_architecture import MultiModalSpectraModel
         
         # Step 1: Load and preprocess data
-        print("\n📂 Loading real data...")
+        print("\n📂 Loading data from CSVs...")
         ingestor = DataIngestion(data_dir="artifacts/data/converted")
         ingestion_data = ingestor.load_all()
         
@@ -672,19 +671,26 @@ if __name__ == "__main__":
             num_workers=0
         )
         
-        # Create dummy targets for testing
-        compound_ids = processed_data['train']['compound_ids']
-        dummy_targets = {
-            'train': np.random.uniform(0, 10, len(processed_data['train']['compound_ids'])).tolist(),
-            'validation': np.random.uniform(0, 10, len(processed_data['validation']['compound_ids'])).tolist()
-        }
-        
+        # ✅ CORRECT: Pass None as target_values - DataTransformation will handle it
+        # The DataTransformation expects targets to be provided separately
+        # For testing without real targets, we need to pass None
         dataloaders = transformer.create_dataloaders(
             processed_data,
-            target_values=dummy_targets
+            target_values=None  # ← No random targets!
         )
         
-        # Step 2: Create model
+        print("\n✅ Data loaded successfully!")
+        
+        # Step 2: Check if dataloaders have targets
+        if dataloaders.get('train') is not None:
+            batch = next(iter(dataloaders['train']))
+            if 'target' not in batch:
+                print("\n⚠️ Warning: No target values found in data.")
+                print("   Please ensure your CSV files contain target values.")
+                print("   For testing, you can add a 'target' column to your CSVs.")
+                sys.exit(1)
+        
+        # Step 3: Create model
         print("\n🤖 Creating model...")
         model = MultiModalSpectraModel(
             hidden_dim=32,  # Small for testing
@@ -693,12 +699,14 @@ if __name__ == "__main__":
             fusion_type='concat'
         )
         
-        # Step 3: Train
+        print(f"   Model created with {model.count_parameters():,} parameters")
+        
+        # Step 4: Train
         print("\n🏋️ Training model (5 epochs for testing)...")
         trainer = ModelTrainer(
             model=model,
             train_loader=dataloaders['train'],
-            val_loader=dataloaders['validation'],
+            val_loader=dataloaders.get('validation'),
             epochs=5,
             learning_rate=0.01,
             log_interval=2,
@@ -708,9 +716,12 @@ if __name__ == "__main__":
         history = trainer.train()
         
         print("\n📊 TRAINING HISTORY SUMMARY:")
-        print(f"  Final train loss: {history['train_loss'][-1]:.4f}")
-        print(f"  Final val loss: {history['val_loss'][-1]:.4f}")
-        print(f"  Best val loss: {min(history['val_loss']):.4f}")
+        if history and history.get('train_loss'):
+            print(f"  Final train loss: {history['train_loss'][-1]:.4f}")
+            print(f"  Final val loss: {history['val_loss'][-1]:.4f}")
+            print(f"  Best val loss: {min(history['val_loss']):.4f}")
+        else:
+            print("  No training history available.")
         
         print("\n✅ Model trainer test complete!")
         

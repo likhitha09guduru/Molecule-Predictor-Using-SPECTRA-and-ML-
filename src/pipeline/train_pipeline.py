@@ -25,7 +25,6 @@ import argparse
 from datetime import datetime
 from typing import Dict, Optional, Any, List, Union
 
-# Import numpy for random targets
 import numpy as np
 import torch
 
@@ -72,7 +71,7 @@ DEFAULT_CONFIG = {
     'num_heads': 4,
     'num_layers': 3,
     'dropout': 0.1,
-    'fusion_type': 'concat',  # 'concat', 'attention', 'gated'
+    'fusion_type': 'concat',
     'target_type': 'regression',
     'output_dim': 1,
     
@@ -248,17 +247,8 @@ class TrainPipeline:
             logging.info("\n🔄 STEP 3: Data Transformation")
             logging.info("-" * 40)
             
-            # Create dummy targets for testing (in real project, load from metadata)
-            # For now, generate random targets
-            dummy_targets = {}
-            for split_name in ['train', 'validation', 'test']:
-                if split_name in processed_data and processed_data[split_name] is not None:
-                    num_samples = len(processed_data[split_name]['compound_ids'])
-                    if self.config['target_type'] == 'regression':
-                        dummy_targets[split_name] = np.random.uniform(0, 10, num_samples).tolist()
-                    else:
-                        dummy_targets[split_name] = np.random.randint(0, self.config['output_dim'], num_samples).tolist()
-            
+            # ✅ CORRECTED: Pass None for target_values (uses real data)
+            # The DataTransformation class will look for target values in the CSV data
             transformer = DataTransformation(
                 batch_size=self.config['batch_size'],
                 shuffle_train=self.config['shuffle_train'],
@@ -268,7 +258,7 @@ class TrainPipeline:
             
             dataloaders = transformer.create_dataloaders(
                 processed_data,
-                target_values=dummy_targets
+                target_values=None  # ← Use REAL data, no random targets!
             )
             
             # Save dataloader statistics
@@ -457,7 +447,6 @@ def main():
             'hidden_dim': args.hidden_dim,
             'fusion_type': args.fusion_type,
             'target_type': args.target_type,
-            # Other defaults from DEFAULT_CONFIG
             **{k: v for k, v in DEFAULT_CONFIG.items() 
                if k not in ['data_dir', 'output_dir', 'epochs', 'batch_size', 
                            'hidden_dim', 'fusion_type', 'target_type']}
