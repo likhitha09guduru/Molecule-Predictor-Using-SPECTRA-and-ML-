@@ -256,9 +256,14 @@ def save_json(data: dict, file_path: Union[str, Path]) -> None:
     try:
         file_path = Path(file_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-
+        
+        # ✅ FIXED: Actually save the JSON data
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=4)
+            
     except Exception as e:
         raise CustomException(e, sys)
+
 
 def load_json(file_path: Union[str, Path]) -> dict:
     """
@@ -270,8 +275,12 @@ def load_json(file_path: Union[str, Path]) -> dict:
     Returns:
         Dictionary with loaded data
     """
-    with open(file_path, 'r') as f:
-        return json.load(f)
+    try:
+        file_path = Path(file_path)
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        raise CustomException(e, sys)
 
 
 def save_pickle(data: object, file_path: Union[str, Path]) -> None:
@@ -282,10 +291,13 @@ def save_pickle(data: object, file_path: Union[str, Path]) -> None:
         data: Object to save
         file_path: Path to save the pickle file
     """
-    file_path = Path(file_path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(file_path, 'wb') as f:
-        pickle.dump(data, f)
+    try:
+        file_path = Path(file_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        raise CustomException(e, sys)
 
 
 def load_pickle(file_path: Union[str, Path]) -> object:
@@ -298,8 +310,12 @@ def load_pickle(file_path: Union[str, Path]) -> object:
     Returns:
         Loaded object
     """
-    with open(file_path, 'rb') as f:
-        return pickle.load(f)
+    try:
+        file_path = Path(file_path)
+        with open(file_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        raise CustomException(e, sys)
 
 
 # ============================================================================
