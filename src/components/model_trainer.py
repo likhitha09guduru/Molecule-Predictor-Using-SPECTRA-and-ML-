@@ -1,405 +1,467 @@
 """
-train_pipeline.py - End-to-end training pipeline.
+model_trainer.py - Training loop for multi-modal spectral model.
 """
 import sys
-import os
 import json
-import pandas as pd
-from pathlib import Path
-import argparse
-from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
-
-import numpy as np
+import time
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from datetime import datetime
+import numpy as np
 
 from src.logger import logging
 from src.exception import CustomException
-from src.utils import ensure_directory, save_json, load_json, save_pickle
-
-from src.components.data_ingestion import DataIngestion
-from src.components.data_preprocessing import SpectralPreprocessor
-from src.components.data_transformation import DataTransformation
-from src.components.model_architecture import MultiModalSpectraModel, create_model
-from src.components.model_trainer import ModelTrainer, run_training_pipeline
+from src.utils import ensure_directory
 
 
-DEFAULT_CONFIG = {
-    'data_dir': 'artifacts/data/converted',
-    'output_dir': 'artifacts/models/',
-    'max_peaks_ms': 200,
-    'max_peaks_nmr': 150,
-    'max_peaks_ir': 100,
-    'noise_threshold_ms': 0.01,
-    'noise_threshold_nmr': 0.001,
-    'noise_threshold_ir': 0.01,
-    'normalize': True,
-    'batch_size': 32,
-    'shuffle_train': True,
-    'num_workers': 0,
-    'hidden_dim': 128,
-    'num_heads': 4,
-    'num_layers': 3,
-    'dropout': 0.1,
-    'fusion_type': 'concat',
-    'target_type': 'regression',
-    'output_dim': 1,
-    'learning_rate': 0.001,
-    'weight_decay': 1e-5,
-    'epochs': 100,
-    'early_stopping_patience': 20,
-    'scheduler_patience': 10,
-    'scheduler_factor': 0.5,
-    'clip_grad_norm': 1.0,
-    'log_interval': 10,
-    'test_size': 0.2,
-    'val_size': 0.15,
-    'use_all_modalities': True
-}
-
-
-class TrainPipeline:
-    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict] = None):
+class ModelTrainer:
+    """Complete training pipeline for multi-modal spectral models."""
+    
+    def __init__(self,
+                 model: nn.Module,
+                 train_loader: DataLoader,
+                 val_loader: Optional[DataLoader] = None,
+                 test_loader: Optional[DataLoader] = None,
+                 learning_rate: float = 0.001,
+                 weight_decay: float = 1e-5,
+                 epochs: int = 100,
+                 early_stopping_patience: int = 20,
+                 scheduler_patience: int = 10,
+                 scheduler_factor: float = 0.5,
+                 clip_grad_norm: Optional[float] = 1.0,
+                 device: Optional[str] = None,
+                 checkpoint_dir: str = "artifacts/models/",
+                 log_interval: int = 10,
+                 target_type: str = 'regression',
+                 num_classes: int = 1):
         try:
-            if config_path is not None:
-                self.config = self._load_config(config_path)
-            elif config is not None:
-                self.config = config
+            self.model = model
+            self.train_loader = train_loader
+            self.val_loader = val_loader
+            self.test_loader = test_loader
+            
+            self.learning_rate = learning_rate
+            self.weight_decay = weight_decay
+            self.epochs = epochs
+            self.early_stopping_patience = early_stopping_patience
+            self.scheduler_patience = scheduler_patience
+            self.scheduler_factor = scheduler_factor
+            self.clip_grad_norm = clip_grad_norm
+            self.log_interval = log_interval
+            self.target_type = target_type
+            self.num_classes = num_classes
+            
+            if device is None:
+                self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             else:
-                self.config = DEFAULT_CONFIG.copy()
+                self.device = torch.device(device)
+            
+            self.model = self.model.to(self.device)
+            
+            self.checkpoint_dir = Path(checkpoint_dir)
+            ensure_directory(self.checkpoint_dir)
             
             self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.run_dir = Path(self.config['output_dir']) / self.timestamp
+            self.run_dir = self.checkpoint_dir / self.timestamp
             ensure_directory(self.run_dir)
-            self._save_config()
+            
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+            
+            if target_type == 'regression':
+                self.criterion = nn.MSELoss()
+            else:
+                self.criterion = nn.CrossEntropyLoss()
+            
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                patience=scheduler_patience,
+                factor=scheduler_factor
+            )
+            
+            self.history = {
+                'train_loss': [],
+                'val_loss': [],
+                'train_metrics': [],
+                'val_metrics': [],
+                'learning_rates': [],
+                'epoch_times': []
+            }
+            
+            self.best_val_loss = float('inf')
+            self.best_epoch = 0
+            self.early_stopping_counter = 0
+            self.has_validation = val_loader is not None
             
             logging.info("=" * 60)
-            logging.info("TRAIN PIPELINE INITIALIZED")
+            logging.info("MODEL TRAINER INITIALIZED")
             logging.info("=" * 60)
-            logging.info(f"  Run directory: {self.run_dir}")
+            logging.info(f"  Device: {self.device}")
+            logging.info(f"  Learning rate: {learning_rate}")
+            logging.info(f"  Max epochs: {epochs}")
+            logging.info(f"  Target type: {target_type}")
+            logging.info(f"  Validation loader: {'✅ Available' if self.has_validation else '❌ None'}")
             logging.info("=" * 60)
             
         except Exception as e:
             raise CustomException(e, sys)
     
-    def _load_config(self, config_path: str) -> Dict:
-        try:
-            with open(config_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            raise CustomException(e, sys)
-    
-    def _save_config(self):
-        try:
-            config_path = self.run_dir / 'config.json'
-            with open(config_path, 'w') as f:
-                json.dump(self.config, f, indent=4)
-            logging.info(f"  Config saved to {config_path}")
-        except Exception as e:
-            raise CustomException(e, sys)
-    
-    def run(self) -> Dict:
+    def train(self) -> Dict:
         try:
             logging.info("\n" + "=" * 60)
-            logging.info("STARTING TRAINING PIPELINE")
+            logging.info("STARTING TRAINING")
             logging.info("=" * 60)
             
-            results = {
-                'run_timestamp': self.timestamp,
-                'run_dir': str(self.run_dir),
-                'config': self.config
-            }
+            if not self.has_validation:
+                logging.warning("⚠️ No validation loader. Training without validation.")
             
-            # =================================================================
-            # STEP 1: Data Ingestion
-            # =================================================================
-            
-            logging.info("\n📂 STEP 1: Data Ingestion")
-            logging.info("-" * 40)
-            
-            ingestor = DataIngestion(
-                data_dir=self.config['data_dir'],
-                chunk_size=10000
-            )
-            
-            ingestion_data = ingestor.load_all()
-            
-            if not ingestion_data['compounds']:
-                logging.error("No data loaded. Please run conversion scripts first.")
-                return results
-            
-            logging.info(f"  Loaded {len(ingestion_data['compounds'])} compounds")
-            logging.info(f"  Multi-modal: {len(ingestion_data['multi_modal_compounds'])}")
-            
-            results['num_compounds'] = len(ingestion_data['compounds'])
-            results['multi_modal_compounds'] = len(ingestion_data['multi_modal_compounds'])
-            
-            # =================================================================
-            # STEP 2: Data Preprocessing
-            # =================================================================
-            
-            logging.info("\n🔧 STEP 2: Data Preprocessing")
-            logging.info("-" * 40)
-            
-            preprocessor = SpectralPreprocessor(
-                max_peaks_ms=self.config['max_peaks_ms'],
-                max_peaks_nmr=self.config['max_peaks_nmr'],
-                max_peaks_ir=self.config['max_peaks_ir'],
-                noise_threshold_ms=self.config['noise_threshold_ms'],
-                noise_threshold_nmr=self.config['noise_threshold_nmr'],
-                noise_threshold_ir=self.config['noise_threshold_ir'],
-                normalize=self.config['normalize'],
-                chunk_size=5000
-            )
-            
-            processed_data = preprocessor.create_dataset(
-                ingestion_data,
-                use_all_modalities=self.config['use_all_modalities']
-            )
-            
-            preprocessor.save_processed_data(
-                processed_data,
-                output_dir=str(self.run_dir / 'processed_data/')
-            )
-            
-            logging.info(f"  Saved processed data to {self.run_dir / 'processed_data/'}")
-            
-            # =================================================================
-            # STEP 3: Data Transformation
-            # =================================================================
-            
-            logging.info("\n🔄 STEP 3: Data Transformation")
-            logging.info("-" * 40)
-            
-            targets_file = Path(self.config['data_dir']) / "ms_spectra.csv"
-            if not targets_file.exists():
-                error_msg = f"❌ Target file not found: {targets_file}"
-                logging.error(error_msg)
-                raise CustomException(error_msg, sys)
-            
-            targets_df = pd.read_csv(targets_file)
-            
-            if 'target' not in targets_df.columns:
-                error_msg = (
-                    f"❌ No 'target' column found in {targets_file}\n"
-                    "   Please add a 'target' column."
-                )
-                logging.error(error_msg)
-                raise CustomException(error_msg, sys)
-            
-            target_dict = dict(zip(targets_df['compound_id'], targets_df['target']))
-            logging.info(f"  Loaded {len(target_dict)} target values from CSV")
-            
-            target_values = {}
-            for split_name in ['train', 'validation', 'test']:
-                if split_name in processed_data and processed_data[split_name] is not None:
-                    compound_ids = processed_data[split_name]['compound_ids']
-                    targets = []
-                    missing = []
-                    for cid in compound_ids:
-                        if cid in target_dict:
-                            targets.append(float(target_dict[cid]))
-                        else:
-                            missing.append(cid)
-                            targets.append(None)
-                    
-                    if missing:
-                        error_msg = (
-                            f"❌ Missing target values for {len(missing)} compounds in {split_name} split.\n"
-                            f"   First 5 missing: {missing[:5]}"
-                        )
-                        logging.error(error_msg)
-                        raise CustomException(error_msg, sys)
-                    
-                    target_values[split_name] = targets
-                    logging.info(f"  ✅ Loaded {len(targets)} targets for {split_name}")
+            for epoch in range(1, self.epochs + 1):
+                epoch_start_time = time.time()
+                
+                # Train
+                train_loss, train_metrics = self._train_epoch(epoch)
+                
+                # Validate (only if available)
+                if self.has_validation:
+                    val_loss, val_metrics = self._validate(epoch)
                 else:
-                    target_values[split_name] = None
-                    logging.warning(f"  No data for {split_name} split")
-            
-            transformer = DataTransformation(
-                batch_size=self.config['batch_size'],
-                shuffle_train=self.config['shuffle_train'],
-                num_workers=self.config['num_workers'],
-                target_type=self.config['target_type']
-            )
-            
-            dataloaders = transformer.create_dataloaders(
-                processed_data,
-                target_values=target_values
-            )
-            
-            transformer.save_dataloader_state(
-                dataloaders,
-                output_dir=str(self.run_dir / 'dataloaders/')
-            )
-            
-            logging.info(f"  Saved DataLoader stats to {self.run_dir / 'dataloaders/'}")
-            
-            # =================================================================
-            # STEP 4: Model Creation
-            # =================================================================
-            
-            logging.info("\n🤖 STEP 4: Model Creation")
-            logging.info("-" * 40)
-            
-            model_config = {
-                'ms_input_dim': 2,
-                'nmr_input_dim': 3,
-                'ir_input_dim': 2,
-                'hidden_dim': self.config['hidden_dim'],
-                'output_dim': self.config['output_dim'],
-                'num_heads': self.config['num_heads'],
-                'num_layers': self.config['num_layers'],
-                'dropout': self.config['dropout'],
-                'fusion_type': self.config['fusion_type'],
-                'target_type': self.config['target_type']
-            }
-            
-            model = create_model(model_config)
-            
-            logging.info(f"  Model created with {model.count_parameters():,} parameters")
-            
-            # =================================================================
-            # STEP 5: Model Training
-            # =================================================================
-            
-            logging.info("\n🏋️ STEP 5: Model Training")
-            logging.info("-" * 40)
-            
-            trainer = ModelTrainer(
-                model=model,
-                train_loader=dataloaders['train'],
-                val_loader=dataloaders.get('validation'),
-                test_loader=dataloaders.get('test'),
-                learning_rate=self.config['learning_rate'],
-                weight_decay=self.config['weight_decay'],
-                epochs=self.config['epochs'],
-                early_stopping_patience=self.config['early_stopping_patience'],
-                scheduler_patience=self.config['scheduler_patience'],
-                scheduler_factor=self.config['scheduler_factor'],
-                clip_grad_norm=self.config['clip_grad_norm'],
-                log_interval=self.config['log_interval'],
-                checkpoint_dir=str(self.run_dir / 'checkpoints/'),
-                target_type=self.config['target_type'],
-                num_classes=self.config['output_dim'] if self.config['target_type'] == 'classification' else 1
-            )
-            
-            history = trainer.train()
-            
-            results['history'] = history
-            if history.get('val_loss') and len(history['val_loss']) > 0:
-                results['best_val_loss'] = min(history['val_loss'])
-                results['best_epoch'] = history['val_loss'].index(min(history['val_loss'])) + 1
-            
-            logging.info(f"\n  ✅ Training complete!")
-            if 'best_val_loss' in results:
-                logging.info(f"  Best validation loss: {results['best_val_loss']:.4f} at epoch {results['best_epoch']}")
-            
-            # =================================================================
-            # STEP 6: Final Evaluation
-            # =================================================================
-            
-            if dataloaders.get('test') is not None:
-                logging.info("\n📊 STEP 6: Final Test Evaluation")
-                logging.info("-" * 40)
+                    val_loss = 0.0
+                    val_metrics = {}
+                    if epoch % 5 == 0:
+                        logging.info(f"  Epoch {epoch}: No validation (skipping)")
                 
-                test_loss, test_metrics = trainer.evaluate(dataloaders['test'])
-                results['test_loss'] = test_loss
-                results['test_metrics'] = test_metrics
+                epoch_time = time.time() - epoch_start_time
                 
+                # Update history
+                self.history['train_loss'].append(train_loss)
+                self.history['val_loss'].append(val_loss)
+                self.history['train_metrics'].append(train_metrics)
+                self.history['val_metrics'].append(val_metrics)
+                self.history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                self.history['epoch_times'].append(epoch_time)
+                
+                # Log
+                self._log_epoch(epoch, train_loss, val_loss, train_metrics, val_metrics, epoch_time)
+                
+                # Learning rate scheduling (only if validation)
+                if self.has_validation:
+                    self.scheduler.step(val_loss)
+                
+                # Checkpoints
+                if self.has_validation:
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.best_epoch = epoch
+                        self.early_stopping_counter = 0
+                        self._save_checkpoint(epoch, val_loss, is_best=True)
+                    else:
+                        self.early_stopping_counter += 1
+                    
+                    if epoch % 10 == 0:
+                        self._save_checkpoint(epoch, val_loss, is_best=False)
+                    
+                    if self.early_stopping_counter >= self.early_stopping_patience:
+                        logging.info(f"\n⏹️ Early stopping at epoch {epoch}")
+                        break
+                else:
+                    # No validation: save checkpoint periodically
+                    if epoch % 10 == 0:
+                        self._save_checkpoint(epoch, 0.0, is_best=False)
+                    self._save_checkpoint(epoch, 0.0, is_best=True)
+            
+            # Save history
+            self._save_history()
+            
+            # Load best model
+            if self.has_validation:
+                self._load_best_model()
+            else:
+                logging.info("No validation loader. Using final model.")
+            
+            # Test evaluation
+            if self.test_loader is not None:
+                test_loss, test_metrics = self.evaluate(self.test_loader)
+                logging.info("\n" + "=" * 60)
+                logging.info("FINAL TEST EVALUATION")
+                logging.info("=" * 60)
                 logging.info(f"  Test Loss: {test_loss:.4f}")
                 for name, value in test_metrics.items():
                     logging.info(f"  Test {name}: {value:.4f}")
-            
-            # =================================================================
-            # STEP 7: Save Final Model
-            # =================================================================
-            
-            logging.info("\n💾 STEP 7: Saving Final Model and Results")
-            logging.info("-" * 40)
-            
-            final_model_path = self.run_dir / 'final_model.pt'
-            torch.save({
-                'model_state_dict': trainer.model.state_dict(),
-                'config': model_config,
-                'history': history,
-                'best_val_loss': results.get('best_val_loss'),
-                'best_epoch': results.get('best_epoch')
-            }, final_model_path)
-            
-            logging.info(f"  Final model saved to {final_model_path}")
-            
-            results_path = self.run_dir / 'results.json'
-            save_json(results, results_path)
-            logging.info(f"  Results saved to {results_path}")
+                self.history['test_metrics'] = test_metrics
+                self.history['test_loss'] = test_loss
             
             logging.info("\n" + "=" * 60)
-            logging.info("✅ TRAINING PIPELINE COMPLETE!")
+            logging.info("TRAINING COMPLETE!")
             logging.info("=" * 60)
-            logging.info(f"  Run directory: {self.run_dir}")
-            if 'best_val_loss' in results:
-                logging.info(f"  Best validation loss: {results['best_val_loss']:.4f}")
-            if 'test_loss' in results:
-                logging.info(f"  Test loss: {results['test_loss']:.4f}")
-            logging.info(f"  Model saved to: {final_model_path}")
+            if self.has_validation:
+                logging.info(f"  Best validation loss: {self.best_val_loss:.4f} at epoch {self.best_epoch}")
+            logging.info(f"  Checkpoint saved to: {self.run_dir}")
             logging.info("=" * 60)
             
-            return results
+            return self.history
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _train_epoch(self, epoch: int) -> Tuple[float, Dict]:
+        try:
+            self.model.train()
+            total_loss = 0.0
+            all_targets = []
+            all_preds = []
+            
+            for batch_idx, batch in enumerate(self.train_loader):
+                ms = batch['ms'].to(self.device)
+                nmr = batch['nmr'].to(self.device)
+                ir = batch['ir'].to(self.device)
+                targets = batch['target'].to(self.device)
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(ms, nmr, ir)
+                
+                if self.target_type == 'regression':
+                    loss = self.criterion(outputs.squeeze(), targets)
+                else:
+                    loss = self.criterion(outputs, targets)
+                
+                loss.backward()
+                
+                if self.clip_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+                
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                all_targets.extend(targets.cpu().numpy())
+                all_preds.extend(outputs.detach().cpu().numpy())
+                
+                if batch_idx % self.log_interval == 0:
+                    logging.info(f"  Epoch {epoch} | Batch {batch_idx}/{len(self.train_loader)} | Loss: {loss.item():.4f}")
+            
+            avg_loss = total_loss / len(self.train_loader)
+            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            return avg_loss, metrics
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _validate(self, epoch: int) -> Tuple[float, Dict]:
+        try:
+            self.model.eval()
+            total_loss = 0.0
+            all_targets = []
+            all_preds = []
+            
+            with torch.no_grad():
+                for batch in self.val_loader:
+                    ms = batch['ms'].to(self.device)
+                    nmr = batch['nmr'].to(self.device)
+                    ir = batch['ir'].to(self.device)
+                    targets = batch['target'].to(self.device)
+                    
+                    outputs = self.model(ms, nmr, ir)
+                    
+                    if self.target_type == 'regression':
+                        loss = self.criterion(outputs.squeeze(), targets)
+                    else:
+                        loss = self.criterion(outputs, targets)
+                    
+                    total_loss += loss.item()
+                    all_targets.extend(targets.cpu().numpy())
+                    all_preds.extend(outputs.detach().cpu().numpy())
+            
+            avg_loss = total_loss / len(self.val_loader)
+            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            return avg_loss, metrics
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def evaluate(self, dataloader: DataLoader) -> Tuple[float, Dict]:
+        try:
+            self.model.eval()
+            total_loss = 0.0
+            all_targets = []
+            all_preds = []
+            
+            with torch.no_grad():
+                for batch in dataloader:
+                    ms = batch['ms'].to(self.device)
+                    nmr = batch['nmr'].to(self.device)
+                    ir = batch['ir'].to(self.device)
+                    targets = batch['target'].to(self.device)
+                    
+                    outputs = self.model(ms, nmr, ir)
+                    
+                    if self.target_type == 'regression':
+                        loss = self.criterion(outputs.squeeze(), targets)
+                    else:
+                        loss = self.criterion(outputs, targets)
+                    
+                    total_loss += loss.item()
+                    all_targets.extend(targets.cpu().numpy())
+                    all_preds.extend(outputs.detach().cpu().numpy())
+            
+            avg_loss = total_loss / len(dataloader)
+            metrics = self._compute_metrics(np.array(all_targets), np.array(all_preds).squeeze())
+            
+            return avg_loss, metrics
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _compute_metrics(self, targets: np.ndarray, predictions: np.ndarray) -> Dict:
+        try:
+            metrics = {}
+            
+            if self.target_type == 'regression':
+                mse = np.mean((targets - predictions) ** 2)
+                mae = np.mean(np.abs(targets - predictions))
+                rmse = np.sqrt(mse)
+                
+                ss_res = np.sum((targets - predictions) ** 2)
+                ss_tot = np.sum((targets - np.mean(targets)) ** 2)
+                r2 = 1 - (ss_res / (ss_tot + 1e-8))
+                
+                metrics = {'mse': mse, 'mae': mae, 'rmse': rmse, 'r2': r2}
+            else:
+                pred_classes = np.argmax(predictions, axis=1)
+                metrics['accuracy'] = np.mean(pred_classes == targets)
+            
+            return metrics
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _save_checkpoint(self, epoch: int, loss: float, is_best: bool = False):
+        try:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'loss': loss,
+                'best_val_loss': self.best_val_loss,
+                'history': self.history,
+                'config': {
+                    'target_type': self.target_type,
+                    'num_classes': self.num_classes,
+                    'learning_rate': self.learning_rate,
+                    'weight_decay': self.weight_decay
+                }
+            }
+            
+            if is_best:
+                path = self.run_dir / "best_model.pt"
+            else:
+                path = self.run_dir / f"checkpoint_epoch_{epoch}.pt"
+            
+            torch.save(checkpoint, path)
+            
+            if is_best:
+                logging.info(f"  ✅ Best model saved to {path}")
+                
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _load_best_model(self):
+        try:
+            best_path = self.run_dir / "best_model.pt"
+            if best_path.exists():
+                checkpoint = torch.load(best_path, map_location=self.device)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                logging.info(f"✅ Loaded best model from {best_path}")
+            else:
+                logging.warning("No best model found, using current model")
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _save_history(self):
+        try:
+            history_serializable = {}
+            for key, value in self.history.items():
+                if isinstance(value, list) and len(value) > 0:
+                    if isinstance(value[0], dict):
+                        history_serializable[key] = [str(v) for v in value]
+                    else:
+                        history_serializable[key] = value
+                else:
+                    history_serializable[key] = value
+            
+            path = self.run_dir / "training_history.json"
+            with open(path, 'w') as f:
+                json.dump(history_serializable, f, indent=4)
+            
+            logging.info(f"✅ Training history saved to {path}")
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def _log_epoch(self, epoch: int, train_loss: float, val_loss: float,
+                   train_metrics: Dict, val_metrics: Dict, epoch_time: float):
+        try:
+            log_msg = f"\nEpoch {epoch}/{self.epochs} ({epoch_time:.1f}s)"
+            log_msg += f"\n  Train Loss: {train_loss:.4f}"
+            
+            if self.has_validation:
+                log_msg += f" | Val Loss: {val_loss:.4f}"
+            else:
+                log_msg += f" | Val Loss: N/A"
+            
+            if train_metrics:
+                log_msg += "\n  Train Metrics:"
+                for name, value in train_metrics.items():
+                    if name not in ['mse', 'mae', 'rmse']:
+                        log_msg += f" {name}: {value:.4f}"
+            
+            if val_metrics and self.has_validation:
+                log_msg += "\n  Val Metrics:"
+                for name, value in val_metrics.items():
+                    if name not in ['mse', 'mae', 'rmse']:
+                        log_msg += f" {name}: {value:.4f}"
+            
+            log_msg += f"\n  LR: {self.optimizer.param_groups[0]['lr']:.6f}"
+            
+            if self.has_validation:
+                log_msg += f" | Best: {self.best_val_loss:.4f} (epoch {self.best_epoch})"
+            
+            logging.info(log_msg)
             
         except Exception as e:
             raise CustomException(e, sys)
 
 
-# ============================================================================
-# COMMAND LINE INTERFACE
-# ============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description='Run the training pipeline')
-    parser.add_argument('--config', type=str, help='Path to config JSON file')
-    parser.add_argument('--data_dir', type=str, default='artifacts/data/converted',
-                        help='Directory with converted CSV files')
-    parser.add_argument('--output_dir', type=str, default='artifacts/models/',
-                        help='Directory to save models')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Maximum number of epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for training')
-    parser.add_argument('--hidden_dim', type=int, default=128,
-                        help='Hidden dimension size')
-    parser.add_argument('--fusion_type', type=str, default='concat',
-                        choices=['concat', 'attention', 'gated'],
-                        help='Fusion type for multi-modal model')
-    parser.add_argument('--target_type', type=str, default='regression',
-                        choices=['regression', 'classification'],
-                        help='Type of prediction task')
-    
-    args = parser.parse_args()
-    
+def run_training_pipeline(
+    model_config: Dict,
+    dataloaders: Dict,
+    training_config: Dict,
+    output_dir: str = "artifacts/models/"
+) -> Dict:
     try:
-        config = {
-            'data_dir': args.data_dir,
-            'output_dir': args.output_dir,
-            'epochs': args.epochs,
-            'batch_size': args.batch_size,
-            'hidden_dim': args.hidden_dim,
-            'fusion_type': args.fusion_type,
-            'target_type': args.target_type,
-            **{k: v for k, v in DEFAULT_CONFIG.items() 
-               if k not in ['data_dir', 'output_dir', 'epochs', 'batch_size', 
-                           'hidden_dim', 'fusion_type', 'target_type']}
-        }
+        from src.components.model_architecture import create_model
         
-        pipeline = TrainPipeline(config=config)
-        results = pipeline.run()
+        model = create_model(model_config)
         
-        print(f"\n✅ Training complete! Results saved to {results['run_dir']}")
+        trainer = ModelTrainer(
+            model=model,
+            train_loader=dataloaders['train'],
+            val_loader=dataloaders.get('validation'),
+            test_loader=dataloaders.get('test'),
+            checkpoint_dir=output_dir,
+            **training_config
+        )
+        
+        return trainer.train()
         
     except Exception as e:
-        logging.error(f"Pipeline failed: {str(e)}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
+        raise CustomException(e, sys)
