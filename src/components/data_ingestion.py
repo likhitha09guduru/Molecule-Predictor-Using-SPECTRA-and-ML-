@@ -1,327 +1,77 @@
-"""
-Data Ingestion Module: Loads CSV files in chunks to prevent memory overflow.
-"""
+import os
 import sys
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Union
-from pathlib import Path
-from sklearn.model_selection import train_test_split
-import gc
-from src.logger import logging
 from src.exception import CustomException
-from src.utils import parse_peak_string, parse_nmr_peaks, validate_compound_id, ensure_directory
+from src.logger import logging
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from dataclasses import dataclass
+
+from src.components.data_transformation import DataTransformation
+from src.components.data_transformation import DataTransformationConfig
+
+from src.components.model_trainer import ModelTrainerConfig
+from src.components.model_trainer import ModelTrainer
+
+
+@dataclass
+class DataIngestionConfig:
+    train_data_path: str = os.path.join('artifacts', "train.csv")
+    test_data_path: str = os.path.join('artifacts', "test.csv")
+    raw_data_path: str = os.path.join('artifacts', "data.csv")
 
 
 class DataIngestion:
-    def __init__(self, data_dir: str = "artifacts/data/converted", chunk_size: int = 10000):
+    def __init__(self):
+        self.ingestion_config = DataIngestionConfig()
+
+    def initiate_data_ingestion(self):
+        logging.info("Entered the data ingestion method or component")
         try:
-            self.data_dir = Path(data_dir)
-            ensure_directory(self.data_dir)
-            self.chunk_size = chunk_size
+            # Reads the fused multimodal dataset built by
+            # notebook/build_multimodal_dataset.py from the REAL, published
+            # "IR-NMR Multimodal Computational Spectra Dataset for 177K
+            # Patent-Extracted Organic Molecules" (Zipoli, Alberts, Laino;
+            # IBM Research; Zenodo record 16417648; CDLA-Permissive-2.0).
+            # Run that script first (requires internet + pyarrow + rdkit)
+            # to produce notebook/data/multimodal_spectra_dataset.csv.
+            data_path = 'notebook/data/multimodal_spectra_dataset.csv'
+            if not os.path.exists(data_path):
+                raise FileNotFoundError(
+                    f"{data_path} not found. Run "
+                    "`python notebook/build_multimodal_dataset.py` first to "
+                    "download and fuse the real IR + NMR dataset."
+                )
+            df = pd.read_csv(data_path)
+            logging.info('Read the real, fused IR + NMR multimodal dataset as dataframe')
 
-            # Storage dictionaries
-            self.compounds = {}
-            self.ms_spectra = {}
-            self.nmr_spectra = {}
-            self.ir_spectra = {}
+            os.makedirs(os.path.dirname(self.ingestion_config.train_data_path), exist_ok=True)
 
-            self.multi_modal_compounds = set()
-            self.single_modal_compounds = set()
+            df.to_csv(self.ingestion_config.raw_data_path, index=False, header=True)
 
-            logging.info("=" * 50)
-            logging.info("DATA INGESTION INITIALIZED")
-            logging.info("=" * 50)
-            logging.info(f"Data directory: {self.data_dir}")
-            logging.info(f"Chunk size: {chunk_size} rows")
-            logging.info("=" * 50)
+            logging.info("Train test split initiated")
+            train_set, test_set = train_test_split(df, test_size=0.2, random_state=42)
 
-        except Exception as e:
-            raise CustomException(e, sys)
+            train_set.to_csv(self.ingestion_config.train_data_path, index=False, header=True)
 
-    def load_all(self,
-                 ms_csv: Optional[Union[str, Path]] = None,
-                 nmr_csv: Optional[Union[str, Path]] = None,
-                 ir_csv: Optional[Union[str, Path]] = None,
-                 test_size: float = 0.2,
-                 val_size: float = 0.15) -> Dict:
-        try:
-            logging.info("\n" + "=" * 50)
-            logging.info("STARTING DATA INGESTION")
-            logging.info("=" * 50)
+            test_set.to_csv(self.ingestion_config.test_data_path, index=False, header=True)
 
-            if ms_csv is None:
-                ms_csv = self.data_dir / "ms_spectra.csv"
-            if nmr_csv is None:
-                nmr_csv = self.data_dir / "nmr_spectra.csv"
-            if ir_csv is None:
-                ir_csv = self.data_dir / "ir_spectra.csv"
+            logging.info("Ingestion of the data is completed")
 
-            self._load_ms_csv_chunked(ms_csv)
-            self._load_nmr_csv_chunked(nmr_csv)
-            self._load_ir_csv_chunked(ir_csv)
-
-            self.align_compounds()
-            self._audit_smiles_coverage()
-            splits = self.create_splits(test_size=test_size, val_size=val_size)
-            self.save_processed_data()
-
-            logging.info("\n" + "=" * 50)
-            logging.info("DATA INGESTION COMPLETE!")
-            logging.info("=" * 50)
-            logging.info(f"Total compounds: {len(self.compounds)}")
-            logging.info(f"Multi-modal (all 3): {len(self.multi_modal_compounds)}")
-            logging.info(f"Train: {len(splits['train'])} | Val: {len(splits['validation'])} | Test: {len(splits['test'])}")
-            logging.info("=" * 50)
-
-            return {
-                'ms': self.ms_spectra,
-                'nmr': self.nmr_spectra,
-                'ir': self.ir_spectra,
-                'compounds': self.compounds,
-                'splits': splits,
-                'multi_modal_compounds': self.multi_modal_compounds
-            }
-
-        except Exception as e:
-            raise CustomException(e, sys)
-
-    def _load_ms_csv_chunked(self, file_path: Path) -> None:
-        try:
-            if not file_path.exists():
-                logging.error(f"MS CSV not found: {file_path}")
-                raise FileNotFoundError(f"Required file not found: {file_path}")
-
-            logging.info(f"Loading MS data from: {file_path}")
-
-            chunk_count = 0
-            for chunk in pd.read_csv(file_path, chunksize=self.chunk_size):
-                chunk_count += 1
-                logging.info(f"Processing chunk {chunk_count} ({len(chunk)} rows)")
-
-                for _, row in chunk.iterrows():
-                    compound_id = str(row['compound_id'])
-
-                    if not validate_compound_id(compound_id):
-                        logging.warning(f"Invalid compound ID: {compound_id}, skipping")
-                        continue
-
-                    self.compounds[compound_id] = self.compounds.get(compound_id, {})
-                    self.compounds[compound_id].update({
-                        'smiles': row.get('smiles', ''),
-                        'ms_source': str(file_path)
-                    })
-
-                    peaks = parse_peak_string(row.get('peaks', ''))
-                    self.ms_spectra[compound_id] = {
-                        'peaks': peaks,
-                        'precursor_mz': row.get('precursor_mz'),
-                        'charge': row.get('charge', 1)
-                    }
-
-                gc.collect()
-
-            logging.info(f"Loaded {len(self.ms_spectra)} mass spectra")
-
-        except Exception as e:
-            raise CustomException(e, sys)
-
-    def _load_nmr_csv_chunked(self, file_path: Path) -> None:
-        try:
-            if not file_path.exists():
-                logging.error(f"NMR CSV not found: {file_path}")
-                raise FileNotFoundError(f"Required file not found: {file_path}")
-
-            logging.info(f"Loading NMR data from: {file_path}")
-
-            chunk_count = 0
-            for chunk in pd.read_csv(file_path, chunksize=self.chunk_size):
-                chunk_count += 1
-                logging.info(f"Processing chunk {chunk_count} ({len(chunk)} rows)")
-
-                for _, row in chunk.iterrows():
-                    compound_id = str(row['compound_id'])
-
-                    if not validate_compound_id(compound_id):
-                        continue
-
-                    proton_peaks = parse_nmr_peaks(row.get('proton_peaks', ''))
-                    carbon_peaks = parse_nmr_peaks(row.get('carbon_peaks', ''))
-
-                    self.nmr_spectra[compound_id] = {
-                        '1H': proton_peaks,
-                        '13C': carbon_peaks,
-                        'solvent': row.get('solvent', 'Unknown')
-                    }
-
-                    self.compounds[compound_id] = self.compounds.get(compound_id, {})
-                    # If MS already gave us a SMILES for this compound, keep it -
-                    # only fill in from here if it's genuinely missing.
-                    if 'smiles' not in self.compounds[compound_id]:
-                        self.compounds[compound_id]['smiles'] = row.get('smiles', '')
-                    self.compounds[compound_id]['nmr_source'] = str(file_path)
-
-                gc.collect()
-
-            logging.info(f"Loaded {len(self.nmr_spectra)} NMR spectra")
-
-        except Exception as e:
-            raise CustomException(e, sys)
-
-    def _load_ir_csv_chunked(self, file_path: Path) -> None:
-        try:
-            if not file_path.exists():
-                logging.error(f"IR CSV not found: {file_path}")
-                raise FileNotFoundError(f"Required file not found: {file_path}")
-
-            logging.info(f"Loading IR data from: {file_path}")
-
-            chunk_count = 0
-            for chunk in pd.read_csv(file_path, chunksize=self.chunk_size):
-                chunk_count += 1
-                logging.info(f"Processing chunk {chunk_count} ({len(chunk)} rows)")
-
-                for _, row in chunk.iterrows():
-                    compound_id = str(row['compound_id'])
-
-                    if not validate_compound_id(compound_id):
-                        continue
-
-                    peaks = parse_peak_string(row.get('peaks', ''))
-
-                    range_str = row.get('range', '400,4000')
-                    try:
-                        low, high = map(float, str(range_str).split(','))
-                        ir_range = (low, high)
-                    except (ValueError, TypeError):
-                        logging.warning(
-                            f"  {compound_id}: unparseable IR range '{range_str}', using default (400, 4000)"
-                        )
-                        ir_range = (400, 4000)
-
-                    self.ir_spectra[compound_id] = {
-                        'peaks': peaks,
-                        'range': ir_range
-                    }
-
-                    self.compounds[compound_id] = self.compounds.get(compound_id, {})
-                    if 'smiles' not in self.compounds[compound_id]:
-                        self.compounds[compound_id]['smiles'] = ''
-                    self.compounds[compound_id]['ir_source'] = str(file_path)
-
-                gc.collect()
-
-            logging.info(f"Loaded {len(self.ir_spectra)} IR spectra")
-
-        except Exception as e:
-            raise CustomException(e, sys)
-
-    # ALIGNMENT AND SPLITS
-    def align_compounds(self) -> None:
-        """Align compounds across modalities."""
-        logging.info("\n--- Aligning Compounds Across Modalities ---")
-
-        all_ids = set(self.compounds.keys())
-        ms_ids = set(self.ms_spectra.keys())
-        nmr_ids = set(self.nmr_spectra.keys())
-        ir_ids = set(self.ir_spectra.keys())
-
-        self.multi_modal_compounds = all_ids.intersection(ms_ids, nmr_ids, ir_ids)
-        # NOTE: despite the name, this includes compounds with ANY modality
-        # (not strictly just one) - kept as "single_modal_compounds" for
-        # compatibility with the rest of the pipeline, but it's really
-        # "at least one modality present".
-        self.single_modal_compounds = all_ids.intersection(ms_ids.union(nmr_ids, ir_ids))
-
-        logging.info(f"Total: {len(all_ids)} | MS: {len(ms_ids)} | NMR: {len(nmr_ids)} | IR: {len(ir_ids)}")
-        logging.info(f"Multi-modal (all 3): {len(self.multi_modal_compounds)}")
-
-    def _audit_smiles_coverage(self) -> None:
-        """
-        Reports how many compounds actually have a real SMILES label.
-        This is the real training target - if this is 0, the model has
-        nothing meaningful to learn from yet.
-        """
-        total = len(self.compounds)
-        with_smiles = sum(1 for c in self.compounds.values() if c.get('smiles'))
-
-        logging.info("\n--- SMILES Label Coverage ---")
-        logging.info(f"  Compounds with SMILES: {with_smiles} / {total}")
-
-        if total > 0 and with_smiles == 0:
-            logging.warning(
-                "  No compounds have a SMILES label. There is currently no "
-                "real target for training - the model has nothing genuine "
-                "to learn from until this is fixed."
+            return (
+                self.ingestion_config.train_data_path,
+                self.ingestion_config.test_data_path
             )
-        elif total > 0 and with_smiles < total:
-            logging.warning(
-                f"  {total - with_smiles} compound(s) are missing a SMILES label. "
-                "These should likely be excluded from training splits."
-            )
-
-    def create_splits(self, test_size: float = 0.2, val_size: float = 0.15) -> Dict[str, List]:
-        """Create train/validation/test splits."""
-        logging.info("\n--- Creating Data Splits ---")
-
-        compound_list = list(self.multi_modal_compounds)
-        if len(compound_list) < 20:
-            logging.warning(f"Only {len(compound_list)} multi-modal compounds. Using all compounds.")
-            compound_list = list(self.single_modal_compounds)
-
-        if len(compound_list) < 5:
-            logging.error("Not enough compounds found for splitting.")
-            return {'train': [], 'validation': [], 'test': []}
-
-        train_val, test = train_test_split(compound_list, test_size=test_size, random_state=42)
-        val_ratio = val_size / (1 - test_size)
-        train, val = train_test_split(train_val, test_size=val_ratio, random_state=42)
-
-        splits = {'train': train, 'validation': val, 'test': test}
-        logging.info(f"Train: {len(train)} | Val: {len(val)} | Test: {len(test)}")
-        return splits
-
-    def save_processed_data(self) -> None:
-        """Save summary of processed data."""
-        processed_dir = self.data_dir.parent / "processed"
-        ensure_directory(processed_dir)
-
-        summary = {
-            'compound_id': list(self.compounds.keys()),
-            'smiles': [self.compounds[cid].get('smiles', '') for cid in self.compounds.keys()],
-            'has_ms': [cid in self.ms_spectra for cid in self.compounds.keys()],
-            'has_nmr': [cid in self.nmr_spectra for cid in self.compounds.keys()],
-            'has_ir': [cid in self.ir_spectra for cid in self.compounds.keys()]
-        }
-        pd.DataFrame(summary).to_csv(processed_dir / "compound_summary.csv", index=False)
-        logging.info(f"Summary saved to {processed_dir}/compound_summary.csv")
-
-    def get_dataset_summary(self) -> Dict:
-        """Get summary statistics."""
-        return {
-            'total_compounds': len(self.compounds),
-            'ms_spectra': len(self.ms_spectra),
-            'nmr_spectra': len(self.nmr_spectra),
-            'ir_spectra': len(self.ir_spectra),
-            'multi_modal': len(self.multi_modal_compounds)
-        }
+        except Exception as e:
+            raise CustomException(e, sys)
 
 
 if __name__ == "__main__":
-    try:
-        print("\n" + "=" * 60)
-        print(" TESTING DATA INGESTION")
-        print("=" * 60)
+    obj = DataIngestion()
+    train_data, test_data = obj.initiate_data_ingestion()
 
-        ingestor = DataIngestion(data_dir="artifacts/data/converted", chunk_size=5000)
-        data = ingestor.load_all()
+    data_transformation = DataTransformation()
+    train_arr, test_arr, _ = data_transformation.initiate_data_transformation(train_data, test_data)
 
-        print("\nDATA SUMMARY:")
-        summary = ingestor.get_dataset_summary()
-        for key, value in summary.items():
-            print(f"  {key}: {value}")
-
-        print("\nData ingestion test complete!")
-
-    except Exception as e:
-        raise CustomException(e, sys)
+    modeltrainer = ModelTrainer()
+    print(modeltrainer.initiate_model_trainer(train_arr, test_arr))

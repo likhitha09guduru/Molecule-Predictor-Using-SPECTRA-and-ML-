@@ -1,31 +1,41 @@
 """
-data_transformation.py - Converts preprocessed data to PyTorch tensors.
+data_transformation.py - Transforms NMR and IR spectral data for molecular prediction.
 """
 import sys
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Optional, Any
+import os
+import numpy as np 
+import pandas as pd
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 import json
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-from src.logger import logging
 from src.exception import CustomException
-from src.utils import ensure_directory
+from src.logger import logging
+from src.utils import save_object, ensure_directory
+
+
+@dataclass
+class DataTransformationConfig:
+    """Configuration for data transformation."""
+    preprocessor_obj_file_path: str = os.path.join('artifacts', 'preprocessor.pkl')
+    train_arr_path: str = os.path.join('artifacts', 'train_arr.npy')
+    test_arr_path: str = os.path.join('artifacts', 'test_arr.npy')
+    val_arr_path: str = os.path.join('artifacts', 'val_arr.npy')
 
 
 class SpectralDataset(Dataset):
-    """PyTorch Dataset for multi-modal spectral data."""
+    """PyTorch Dataset for NMR and IR spectral data."""
     
     def __init__(self, 
-                 ms_spectra: np.ndarray,
                  nmr_spectra: np.ndarray,
                  ir_spectra: np.ndarray,
                  targets: Optional[np.ndarray] = None,
                  compound_ids: Optional[List[str]] = None,
                  target_type: str = 'regression'):
         try:
-            self.ms_spectra = torch.tensor(ms_spectra, dtype=torch.float32)
             self.nmr_spectra = torch.tensor(nmr_spectra, dtype=torch.float32)
             self.ir_spectra = torch.tensor(ir_spectra, dtype=torch.float32)
             
@@ -39,9 +49,9 @@ class SpectralDataset(Dataset):
             
             self.compound_ids = compound_ids
             self.target_type = target_type
-            self.length = len(ms_spectra)
+            self.length = len(nmr_spectra)
             
-            logging.info(f"SpectralDataset initialized with {self.length} samples")
+            logging.info(f"SpectralDataset initialized with {self.length} samples (NMR+IR)")
             
         except Exception as e:
             raise CustomException(e, sys)
@@ -51,7 +61,6 @@ class SpectralDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = {
-            'ms': self.ms_spectra[idx],
             'nmr': self.nmr_spectra[idx],
             'ir': self.ir_spectra[idx]
         }
@@ -66,135 +75,278 @@ class SpectralDataset(Dataset):
 
 
 class DataTransformation:
-    """Transforms preprocessed data into PyTorch tensors and DataLoaders."""
+    """
+    Data transformation class for NMR and IR spectral data.
+    """
     
-    def __init__(self, 
-                 batch_size: int = 32,
-                 shuffle_train: bool = True,
-                 num_workers: int = 0,
-                 pin_memory: bool = False,
-                 target_type: str = 'regression',
-                 drop_last: bool = False):
+    def __init__(self, max_peaks_nmr: int = 150, max_peaks_ir: int = 100):
+        """Initialize data transformation with configuration."""
+        self.data_transformation_config = DataTransformationConfig()
+        self.batch_size = 32
+        self.shuffle_train = True
+        self.num_workers = 0
+        self.pin_memory = False
+        self.target_type = 'regression'
+        self.max_peaks_nmr = max_peaks_nmr
+        self.max_peaks_ir = max_peaks_ir
+        
+        logging.info("=" * 60)
+        logging.info("DATA TRANSFORMATION INITIALIZED (NMR + IR)")
+        logging.info("=" * 60)
+        logging.info(f"  Batch size: {self.batch_size}")
+        logging.info(f"  Target type: {self.target_type}")
+        logging.info(f"  Max NMR peaks: {self.max_peaks_nmr}")
+        logging.info(f"  Max IR peaks: {self.max_peaks_ir}")
+        logging.info("=" * 60)
+    
+    def _process_spectral_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Process spectral data from DataFrame into numpy arrays.
+        
+        Args:
+            df: DataFrame with NMR and IR data
+        
+        Returns:
+            Tuple of (nmr_array, ir_array, targets)
+        """
         try:
-            self.batch_size = batch_size
-            self.shuffle_train = shuffle_train
-            self.num_workers = num_workers
-            self.pin_memory = pin_memory
-            self.target_type = target_type
-            self.drop_last = drop_last
+            nmr_list = []
+            ir_list = []
+            target_list = []
             
-            logging.info("=" * 60)
-            logging.info("DATA TRANSFORMATION INITIALIZED")
-            logging.info("=" * 60)
-            logging.info(f"  Batch size: {batch_size}")
-            logging.info(f"  Shuffle train: {shuffle_train}")
-            logging.info(f"  Target type: {target_type}")
-            logging.info("=" * 60)
+            for idx, row in df.iterrows():
+                # Process NMR peaks
+                nmr_data = np.zeros((self.max_peaks_nmr, 3), dtype=np.float32)
+                
+                # Get proton peaks (1H) - format: [(shift, multiplicity, intensity), ...]
+                proton_peaks = row.get('proton_peaks', [])
+                if isinstance(proton_peaks, str):
+                    # Parse string if needed
+                    try:
+                        proton_peaks = eval(proton_peaks)
+                    except:
+                        proton_peaks = []
+                
+                # Fill NMR data
+                for i, peak in enumerate(proton_peaks[:self.max_peaks_nmr]):
+                    if isinstance(peak, (tuple, list)) and len(peak) >= 3:
+                        nmr_data[i, 0] = float(peak[0])  # chemical shift
+                        # Encode multiplicity
+                        mult = str(peak[1]).lower()
+                        mult_map = {'s': 0, 'd': 1, 't': 2, 'q': 3, 'm': 4, 'dd': 5, 'dt': 6, 'td': 7, 'brs': 8}
+                        nmr_data[i, 1] = mult_map.get(mult, 4)  # default to 'm'
+                        nmr_data[i, 2] = float(peak[2])  # intensity
+                
+                nmr_list.append(nmr_data)
+                
+                # Process IR peaks
+                ir_data = np.zeros((self.max_peaks_ir, 2), dtype=np.float32)
+                
+                ir_peaks = row.get('ir_peaks', [])
+                if isinstance(ir_peaks, str):
+                    try:
+                        ir_peaks = eval(ir_peaks)
+                    except:
+                        ir_peaks = []
+                
+                for i, peak in enumerate(ir_peaks[:self.max_peaks_ir]):
+                    if isinstance(peak, (tuple, list)) and len(peak) >= 2:
+                        ir_data[i, 0] = float(peak[0])  # wavenumber
+                        ir_data[i, 1] = float(peak[1])  # intensity
+                
+                ir_list.append(ir_data)
+                
+                # Get target (using SMILES as target for now)
+                target = row.get('smiles', '')
+                # For regression, use a numeric target - you can replace with actual target
+                # For now, use proton_count as a placeholder target
+                target_val = row.get('proton_count', 0)
+                target_list.append(float(target_val))
+            
+            return np.array(nmr_list), np.array(ir_list), np.array(target_list)
+            
+        except Exception as e:
+            raise CustomException(e, sys)
+    
+    def initiate_data_transformation(self, 
+                                     train_path: str,
+                                     test_path: str,
+                                     val_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], str]:
+        """
+        Initiate data transformation for NMR and IR data.
+        
+        Args:
+            train_path: Path to training data CSV
+            test_path: Path to test data CSV
+            val_path: Path to validation data CSV (optional)
+            
+        Returns:
+            Tuple of (train_arr, test_arr, val_arr, preprocessor_path)
+        """
+        try:
+            logging.info("Entered data transformation method")
+            
+            # Read data
+            train_df = pd.read_csv(train_path)
+            test_df = pd.read_csv(test_path)
+            
+            if val_path:
+                val_df = pd.read_csv(val_path)
+                logging.info(f"Validation data loaded: {len(val_df)} rows")
+            
+            logging.info(f"Train data loaded: {len(train_df)} rows")
+            logging.info(f"Test data loaded: {len(test_df)} rows")
+            
+            # Process spectral data
+            logging.info("Processing spectral data into numerical arrays...")
+            
+            # Process train data
+            train_nmr, train_ir, train_targets = self._process_spectral_data(train_df)
+            logging.info(f"Train NMR shape: {train_nmr.shape}, Train IR shape: {train_ir.shape}")
+            
+            # Process test data
+            test_nmr, test_ir, test_targets = self._process_spectral_data(test_df)
+            logging.info(f"Test NMR shape: {test_nmr.shape}, Test IR shape: {test_ir.shape}")
+            
+            # Process validation data if available
+            if val_path:
+                val_nmr, val_ir, val_targets = self._process_spectral_data(val_df)
+                logging.info(f"Val NMR shape: {val_nmr.shape}, Val IR shape: {val_ir.shape}")
+            else:
+                val_nmr, val_ir, val_targets = None, None, None
+            
+            # For sklearn compatibility, flatten the spectral data
+            # This creates feature vectors for sklearn models
+            train_nmr_flat = train_nmr.reshape(train_nmr.shape[0], -1)
+            train_ir_flat = train_ir.reshape(train_ir.shape[0], -1)
+            train_features = np.concatenate([train_nmr_flat, train_ir_flat], axis=1)
+            
+            test_nmr_flat = test_nmr.reshape(test_nmr.shape[0], -1)
+            test_ir_flat = test_ir.reshape(test_ir.shape[0], -1)
+            test_features = np.concatenate([test_nmr_flat, test_ir_flat], axis=1)
+            
+            # Create arrays with targets
+            train_arr = np.c_[train_features, train_targets.reshape(-1, 1)]
+            test_arr = np.c_[test_features, test_targets.reshape(-1, 1)]
+            
+            if val_path:
+                val_nmr_flat = val_nmr.reshape(val_nmr.shape[0], -1)
+                val_ir_flat = val_ir.reshape(val_ir.shape[0], -1)
+                val_features = np.concatenate([val_nmr_flat, val_ir_flat], axis=1)
+                val_arr = np.c_[val_features, val_targets.reshape(-1, 1)]
+            else:
+                val_arr = None
+            
+            # Save arrays
+            np.save(self.data_transformation_config.train_arr_path, train_arr)
+            np.save(self.data_transformation_config.test_arr_path, test_arr)
+            if val_arr is not None:
+                np.save(self.data_transformation_config.val_arr_path, val_arr)
+            
+            logging.info(f"Train array shape: {train_arr.shape}")
+            logging.info(f"Test array shape: {test_arr.shape}")
+            if val_arr is not None:
+                logging.info(f"Validation array shape: {val_arr.shape}")
+            
+            logging.info("Data transformation completed successfully")
+            
+            return (
+                train_arr,
+                test_arr,
+                val_arr,
+                self.data_transformation_config.preprocessor_obj_file_path
+            )
             
         except Exception as e:
             raise CustomException(e, sys)
     
     def create_dataloaders(self, 
-                           processed_data: Dict,
-                           target_values: Optional[Dict] = None) -> Dict[str, DataLoader]:
+                          train_nmr: np.ndarray,
+                          train_ir: np.ndarray,
+                          train_targets: np.ndarray,
+                          test_nmr: np.ndarray,
+                          test_ir: np.ndarray,
+                          test_targets: np.ndarray,
+                          val_nmr: Optional[np.ndarray] = None,
+                          val_ir: Optional[np.ndarray] = None,
+                          val_targets: Optional[np.ndarray] = None) -> Dict[str, DataLoader]:
         """
-        Create DataLoaders for train, validation, and test splits.
+        Create PyTorch DataLoaders from spectral data.
         
         Args:
-            processed_data: Output from SpectralPreprocessor.create_dataset()
-            target_values: Dictionary mapping split_name -> list of target values
+            train_nmr: Training NMR data
+            train_ir: Training IR data
+            train_targets: Training targets
+            test_nmr: Test NMR data
+            test_ir: Test IR data
+            test_targets: Test targets
+            val_nmr: Validation NMR data (optional)
+            val_ir: Validation IR data (optional)
+            val_targets: Validation targets (optional)
         
         Returns:
             Dictionary with 'train', 'validation', 'test' DataLoaders
-        
-        Raises:
-            CustomException: If no targets are provided
         """
         try:
             logging.info("\n" + "=" * 60)
-            logging.info("CREATING DATALOADERS")
+            logging.info("CREATING PYTORCH DATALOADERS")
             logging.info("=" * 60)
-            
-            # ✅ REQUIRED: Check if targets are provided
-            if target_values is None:
-                error_msg = (
-                    "❌ FATAL: No target values provided!\n"
-                    "   target_values parameter is required.\n"
-                    "   Please provide target_values as a dictionary:\n"
-                    "   target_values = {\n"
-                    "       'train': [0.5, 1.2, 0.8, ...],\n"
-                    "       'validation': [0.6, 1.1, ...],\n"
-                    "       'test': [0.7, 0.9, ...]\n"
-                    "   }\n"
-                    "   The number of targets must match the number of compounds in each split."
-                )
-                logging.error(error_msg)
-                raise CustomException(error_msg, sys)
             
             dataloaders = {}
             
-            for split_name in ['train', 'validation', 'test']:
-                if split_name not in processed_data or processed_data[split_name] is None:
-                    logging.warning(f"No data available for {split_name} split")
-                    dataloaders[split_name] = None
-                    continue
-                
-                data = processed_data[split_name]
-                compound_ids = data.get('compound_ids', [])
-                num_samples = len(compound_ids)
-                
-                # ✅ REQUIRED: Check if targets exist for this split
-                if split_name not in target_values or target_values[split_name] is None:
-                    error_msg = (
-                        f"❌ FATAL: No targets provided for {split_name} split!\n"
-                        f"   Expected {num_samples} targets for {split_name}.\n"
-                        f"   Available splits in target_values: {list(target_values.keys())}\n"
-                        f"   Please add targets for '{split_name}' split."
-                    )
-                    logging.error(error_msg)
-                    raise CustomException(error_msg, sys)
-                
-                targets_array = target_values[split_name]
-                
-                # ✅ REQUIRED: Check if target count matches compound count
-                if len(targets_array) != num_samples:
-                    error_msg = (
-                        f"❌ FATAL: Target count mismatch for {split_name} split!\n"
-                        f"   Number of compounds: {num_samples}\n"
-                        f"   Number of targets: {len(targets_array)}\n"
-                        f"   These must match. Please check your target values."
-                    )
-                    logging.error(error_msg)
-                    raise CustomException(error_msg, sys)
-                
-                targets = np.array(targets_array, dtype=np.float32)
-                logging.info(f"  ✅ Using provided targets for {split_name}: {len(targets)} samples")
-                
-                # Create dataset
-                dataset = SpectralDataset(
-                    ms_spectra=data['ms'],
-                    nmr_spectra=data['nmr'],
-                    ir_spectra=data['ir'],
-                    targets=targets,
-                    compound_ids=compound_ids,
+            # Training dataloader
+            train_dataset = SpectralDataset(
+                nmr_spectra=train_nmr,
+                ir_spectra=train_ir,
+                targets=train_targets,
+                target_type=self.target_type
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.batch_size,
+                shuffle=self.shuffle_train,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory
+            )
+            dataloaders['train'] = train_loader
+            logging.info(f"  Train: {len(train_dataset)} samples, {len(train_loader)} batches")
+            
+            # Test dataloader
+            test_dataset = SpectralDataset(
+                nmr_spectra=test_nmr,
+                ir_spectra=test_ir,
+                targets=test_targets,
+                target_type=self.target_type
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory
+            )
+            dataloaders['test'] = test_loader
+            logging.info(f"  Test: {len(test_dataset)} samples, {len(test_loader)} batches")
+            
+            # Validation dataloader if available
+            if val_nmr is not None:
+                val_dataset = SpectralDataset(
+                    nmr_spectra=val_nmr,
+                    ir_spectra=val_ir,
+                    targets=val_targets,
                     target_type=self.target_type
                 )
-                
-                # Create dataloader
-                shuffle = self.shuffle_train if split_name == 'train' else False
-                dataloader = DataLoader(
-                    dataset,
+                val_loader = DataLoader(
+                    val_dataset,
                     batch_size=self.batch_size,
-                    shuffle=shuffle,
+                    shuffle=False,
                     num_workers=self.num_workers,
-                    pin_memory=self.pin_memory,
-                    drop_last=self.drop_last and split_name == 'train'
+                    pin_memory=self.pin_memory
                 )
-                
-                dataloaders[split_name] = dataloader
-                logging.info(f"  {split_name}: {len(dataset)} samples, {len(dataloader)} batches")
+                dataloaders['validation'] = val_loader
+                logging.info(f"  Validation: {len(val_dataset)} samples, {len(val_loader)} batches")
             
-            logging.info("\n" + "=" * 60)
+            logging.info("=" * 60)
             logging.info("✅ DATALOADERS CREATED SUCCESSFULLY!")
             logging.info("=" * 60)
             
@@ -202,30 +354,16 @@ class DataTransformation:
             
         except Exception as e:
             raise CustomException(e, sys)
-    
-    def save_dataloader_state(self, 
-                              dataloaders: Dict[str, DataLoader],
-                              output_dir: str = "artifacts/data/dataloaders/") -> None:
-        try:
-            output_path = Path(output_dir)
-            ensure_directory(output_path)
-            
-            stats = {}
-            for split_name, loader in dataloaders.items():
-                if loader is not None:
-                    stats[split_name] = {
-                        'num_samples': len(loader.dataset),
-                        'num_batches': len(loader),
-                        'batch_size': self.batch_size,
-                        'ms_shape': loader.dataset.ms_spectra.shape if hasattr(loader.dataset, 'ms_spectra') else None,
-                        'nmr_shape': loader.dataset.nmr_spectra.shape if hasattr(loader.dataset, 'nmr_spectra') else None,
-                        'ir_shape': loader.dataset.ir_spectra.shape if hasattr(loader.dataset, 'ir_spectra') else None
-                    }
-            
-            with open(output_path / 'dataloader_stats.json', 'w') as f:
-                json.dump(stats, f, indent=4)
-            
-            logging.info(f"DataLoader statistics saved to {output_path}")
-            
-        except Exception as e:
-            raise CustomException(e, sys)
+
+
+if __name__ == "__main__":
+    try:
+        print("\n" + "=" * 60)
+        print("🧪 TESTING DATA TRANSFORMATION (NMR + IR)")
+        print("=" * 60)
+        
+        data_transformation = DataTransformation()
+        print("\n✅ Data transformation test completed!")
+        
+    except Exception as e:
+        raise CustomException(e, sys)
