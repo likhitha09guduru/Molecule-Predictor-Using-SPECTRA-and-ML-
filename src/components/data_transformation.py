@@ -1,369 +1,158 @@
-"""
-data_transformation.py - Transforms NMR and IR spectral data for molecular prediction.
-"""
 import sys
-import os
-import numpy as np 
-import pandas as pd
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
-from pathlib import Path
-import json
-import torch
-from torch.utils.data import Dataset, DataLoader
+
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from src.exception import CustomException
 from src.logger import logging
-from src.utils import save_object, ensure_directory
+import os
+
+from src.utils import save_object
 
 
 @dataclass
 class DataTransformationConfig:
-    """Configuration for data transformation."""
-    preprocessor_obj_file_path: str = os.path.join('artifacts', 'preprocessor.pkl')
-    train_arr_path: str = os.path.join('artifacts', 'train_arr.npy')
-    test_arr_path: str = os.path.join('artifacts', 'test_arr.npy')
-    val_arr_path: str = os.path.join('artifacts', 'val_arr.npy')
-
-
-class SpectralDataset(Dataset):
-    """PyTorch Dataset for NMR and IR spectral data."""
-    
-    def __init__(self, 
-                 nmr_spectra: np.ndarray,
-                 ir_spectra: np.ndarray,
-                 targets: Optional[np.ndarray] = None,
-                 compound_ids: Optional[List[str]] = None,
-                 target_type: str = 'regression'):
-        try:
-            self.nmr_spectra = torch.tensor(nmr_spectra, dtype=torch.float32)
-            self.ir_spectra = torch.tensor(ir_spectra, dtype=torch.float32)
-            
-            if targets is not None:
-                if target_type == 'regression':
-                    self.targets = torch.tensor(targets, dtype=torch.float32)
-                else:
-                    self.targets = torch.tensor(targets, dtype=torch.long)
-            else:
-                self.targets = None
-            
-            self.compound_ids = compound_ids
-            self.target_type = target_type
-            self.length = len(nmr_spectra)
-            
-            logging.info(f"SpectralDataset initialized with {self.length} samples (NMR+IR)")
-            
-        except Exception as e:
-            raise CustomException(e, sys)
-    
-    def __len__(self) -> int:
-        return self.length
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = {
-            'nmr': self.nmr_spectra[idx],
-            'ir': self.ir_spectra[idx]
-        }
-        
-        if self.targets is not None:
-            sample['target'] = self.targets[idx]
-        
-        if self.compound_ids is not None:
-            sample['compound_id'] = self.compound_ids[idx]
-        
-        return sample
+    preprocessor_obj_file_path = os.path.join('artifacts', "preprocessor.pkl")
 
 
 class DataTransformation:
     """
-    Data transformation class for NMR and IR spectral data.
+    Builds the fusion preprocessing pipeline that combines the two
+    numeric spectral modalities (IR + NMR) with the categorical
+    descriptor modality (functional group + solvent) into a single
+    feature vector the downstream regressor can consume.
     """
-    
-    def __init__(self, max_peaks_nmr: int = 150, max_peaks_ir: int = 100):
-        """Initialize data transformation with configuration."""
+
+    def __init__(self):
         self.data_transformation_config = DataTransformationConfig()
-        self.batch_size = 32
-        self.shuffle_train = True
-        self.num_workers = 0
-        self.pin_memory = False
-        self.target_type = 'regression'
-        self.max_peaks_nmr = max_peaks_nmr
-        self.max_peaks_ir = max_peaks_ir
-        
-        logging.info("=" * 60)
-        logging.info("DATA TRANSFORMATION INITIALIZED (NMR + IR)")
-        logging.info("=" * 60)
-        logging.info(f"  Batch size: {self.batch_size}")
-        logging.info(f"  Target type: {self.target_type}")
-        logging.info(f"  Max NMR peaks: {self.max_peaks_nmr}")
-        logging.info(f"  Max IR peaks: {self.max_peaks_ir}")
-        logging.info("=" * 60)
-    
-    def _process_spectral_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Process spectral data from DataFrame into numpy arrays.
-        
-        Args:
-            df: DataFrame with NMR and IR data
-        
-        Returns:
-            Tuple of (nmr_array, ir_array, targets)
-        """
+
+    def get_data_transformer_object(self):
+        '''
+        This function is responsible for the multimodal data transformation:
+        it fuses the IR modality, the NMR modality and the categorical
+        descriptor modality into one preprocessing ColumnTransformer.
+        '''
         try:
-            nmr_list = []
-            ir_list = []
-            target_list = []
-            
-            for idx, row in df.iterrows():
-                # Process NMR peaks
-                nmr_data = np.zeros((self.max_peaks_nmr, 3), dtype=np.float32)
-                
-                # Get proton peaks (1H) - format: [(shift, multiplicity, intensity), ...]
-                proton_peaks = row.get('proton_peaks', [])
-                if isinstance(proton_peaks, str):
-                    # Parse string if needed
-                    try:
-                        proton_peaks = eval(proton_peaks)
-                    except:
-                        proton_peaks = []
-                
-                # Fill NMR data
-                for i, peak in enumerate(proton_peaks[:self.max_peaks_nmr]):
-                    if isinstance(peak, (tuple, list)) and len(peak) >= 3:
-                        nmr_data[i, 0] = float(peak[0])  # chemical shift
-                        # Encode multiplicity
-                        mult = str(peak[1]).lower()
-                        mult_map = {'s': 0, 'd': 1, 't': 2, 'q': 3, 'm': 4, 'dd': 5, 'dt': 6, 'td': 7, 'brs': 8}
-                        nmr_data[i, 1] = mult_map.get(mult, 4)  # default to 'm'
-                        nmr_data[i, 2] = float(peak[2])  # intensity
-                
-                nmr_list.append(nmr_data)
-                
-                # Process IR peaks
-                ir_data = np.zeros((self.max_peaks_ir, 2), dtype=np.float32)
-                
-                ir_peaks = row.get('ir_peaks', [])
-                if isinstance(ir_peaks, str):
-                    try:
-                        ir_peaks = eval(ir_peaks)
-                    except:
-                        ir_peaks = []
-                
-                for i, peak in enumerate(ir_peaks[:self.max_peaks_ir]):
-                    if isinstance(peak, (tuple, list)) and len(peak) >= 2:
-                        ir_data[i, 0] = float(peak[0])  # wavenumber
-                        ir_data[i, 1] = float(peak[1])  # intensity
-                
-                ir_list.append(ir_data)
-                
-                # Get target (using SMILES as target for now)
-                target = row.get('smiles', '')
-                # For regression, use a numeric target - you can replace with actual target
-                # For now, use proton_count as a placeholder target
-                target_val = row.get('proton_count', 0)
-                target_list.append(float(target_val))
-            
-            return np.array(nmr_list), np.array(ir_list), np.array(target_list)
-            
+            # Numeric modalities, engineered from the real Zenodo IR-NMR
+            # dataset by notebook/build_multimodal_dataset.py:
+            # IR modality: intensity integrated over standard functional-group bands
+            ir_modality_columns = [
+                "ir_band_ohnh_stretch_3200_3550",
+                "ir_band_ch_stretch_2850_3000",
+                "ir_band_carbonyl_1650_1750",
+                "ir_band_aromatic_1450_1600",
+                "ir_band_fingerprint_500_1500",
+            ]
+            # NMR modality: 1H + 13C chemical-shift spectrum summary statistics
+            nmr_modality_columns = [
+                "h_nmr_shift_mean",
+                "h_nmr_shift_std",
+                "h_nmr_shift_max",
+                "h_nmr_peak_count",
+                "c_nmr_shift_mean",
+                "c_nmr_shift_std",
+                "c_nmr_shift_max",
+                "c_nmr_peak_count",
+            ]
+            numerical_columns = ir_modality_columns + nmr_modality_columns
+
+            # Categorical descriptor modality: real composition flags derived
+            # from each molecule's SMILES via RDKit
+            categorical_columns = [
+                "contains_nitrogen",
+                "contains_oxygen",
+                "contains_halogen",
+                "contains_sulfur",
+            ]
+
+            num_pipeline = Pipeline(
+                steps=[
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler())
+
+                ]
+            )
+
+            cat_pipeline = Pipeline(
+
+                steps=[
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("one_hot_encoder", OneHotEncoder()),
+                    ("scaler", StandardScaler(with_mean=False))
+                ]
+
+            )
+
+            logging.info(f"Categorical (descriptor modality) columns: {categorical_columns}")
+            logging.info(f"Numerical (IR + NMR modality) columns: {numerical_columns}")
+
+            preprocessor = ColumnTransformer(
+                [
+                    ("num_pipeline", num_pipeline, numerical_columns),
+                    ("cat_pipelines", cat_pipeline, categorical_columns)
+
+                ]
+
+            )
+
+            return preprocessor
+
         except Exception as e:
             raise CustomException(e, sys)
-    
-    def initiate_data_transformation(self, 
-                                     train_path: str,
-                                     test_path: str,
-                                     val_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], str]:
-        """
-        Initiate data transformation for NMR and IR data.
-        
-        Args:
-            train_path: Path to training data CSV
-            test_path: Path to test data CSV
-            val_path: Path to validation data CSV (optional)
-            
-        Returns:
-            Tuple of (train_arr, test_arr, val_arr, preprocessor_path)
-        """
+
+    def initiate_data_transformation(self, train_path, test_path):
+
         try:
-            logging.info("Entered data transformation method")
-            
-            # Read data
             train_df = pd.read_csv(train_path)
             test_df = pd.read_csv(test_path)
-            
-            if val_path:
-                val_df = pd.read_csv(val_path)
-                logging.info(f"Validation data loaded: {len(val_df)} rows")
-            
-            logging.info(f"Train data loaded: {len(train_df)} rows")
-            logging.info(f"Test data loaded: {len(test_df)} rows")
-            
-            # Process spectral data
-            logging.info("Processing spectral data into numerical arrays...")
-            
-            # Process train data
-            train_nmr, train_ir, train_targets = self._process_spectral_data(train_df)
-            logging.info(f"Train NMR shape: {train_nmr.shape}, Train IR shape: {train_ir.shape}")
-            
-            # Process test data
-            test_nmr, test_ir, test_targets = self._process_spectral_data(test_df)
-            logging.info(f"Test NMR shape: {test_nmr.shape}, Test IR shape: {test_ir.shape}")
-            
-            # Process validation data if available
-            if val_path:
-                val_nmr, val_ir, val_targets = self._process_spectral_data(val_df)
-                logging.info(f"Val NMR shape: {val_nmr.shape}, Val IR shape: {val_ir.shape}")
-            else:
-                val_nmr, val_ir, val_targets = None, None, None
-            
-            # For sklearn compatibility, flatten the spectral data
-            # This creates feature vectors for sklearn models
-            train_nmr_flat = train_nmr.reshape(train_nmr.shape[0], -1)
-            train_ir_flat = train_ir.reshape(train_ir.shape[0], -1)
-            train_features = np.concatenate([train_nmr_flat, train_ir_flat], axis=1)
-            
-            test_nmr_flat = test_nmr.reshape(test_nmr.shape[0], -1)
-            test_ir_flat = test_ir.reshape(test_ir.shape[0], -1)
-            test_features = np.concatenate([test_nmr_flat, test_ir_flat], axis=1)
-            
-            # Create arrays with targets
-            train_arr = np.c_[train_features, train_targets.reshape(-1, 1)]
-            test_arr = np.c_[test_features, test_targets.reshape(-1, 1)]
-            
-            if val_path:
-                val_nmr_flat = val_nmr.reshape(val_nmr.shape[0], -1)
-                val_ir_flat = val_ir.reshape(val_ir.shape[0], -1)
-                val_features = np.concatenate([val_nmr_flat, val_ir_flat], axis=1)
-                val_arr = np.c_[val_features, val_targets.reshape(-1, 1)]
-            else:
-                val_arr = None
-            
-            # Save arrays
-            np.save(self.data_transformation_config.train_arr_path, train_arr)
-            np.save(self.data_transformation_config.test_arr_path, test_arr)
-            if val_arr is not None:
-                np.save(self.data_transformation_config.val_arr_path, val_arr)
-            
-            logging.info(f"Train array shape: {train_arr.shape}")
-            logging.info(f"Test array shape: {test_arr.shape}")
-            if val_arr is not None:
-                logging.info(f"Validation array shape: {val_arr.shape}")
-            
-            logging.info("Data transformation completed successfully")
-            
+
+            logging.info("Read train and test multimodal data completed")
+
+            logging.info("Obtaining preprocessing (multimodal fusion) object")
+
+            preprocessing_obj = self.get_data_transformer_object()
+
+            # Real target: molecular weight (g/mol), computed with RDKit from
+            # each molecule's actual SMILES structure - the task is to
+            # predict it purely from the fused IR + NMR spectral features.
+            target_column_name = "molecular_weight"
+
+            input_feature_train_df = train_df.drop(columns=[target_column_name])
+            target_feature_train_df = train_df[target_column_name]
+
+            input_feature_test_df = test_df.drop(columns=[target_column_name])
+            target_feature_test_df = test_df[target_column_name]
+
+            logging.info(
+                "Applying multimodal fusion preprocessing object on training dataframe and testing dataframe."
+            )
+
+            input_feature_train_arr = preprocessing_obj.fit_transform(input_feature_train_df)
+            input_feature_test_arr = preprocessing_obj.transform(input_feature_test_df)
+
+            train_arr = np.c_[
+                input_feature_train_arr, np.array(target_feature_train_df)
+            ]
+            test_arr = np.c_[input_feature_test_arr, np.array(target_feature_test_df)]
+
+            logging.info("Saved preprocessing object.")
+
+            save_object(
+
+                file_path=self.data_transformation_config.preprocessor_obj_file_path,
+                obj=preprocessing_obj
+
+            )
+
             return (
                 train_arr,
                 test_arr,
-                val_arr,
-                self.data_transformation_config.preprocessor_obj_file_path
+                self.data_transformation_config.preprocessor_obj_file_path,
             )
-            
         except Exception as e:
             raise CustomException(e, sys)
-    
-    def create_dataloaders(self, 
-                          train_nmr: np.ndarray,
-                          train_ir: np.ndarray,
-                          train_targets: np.ndarray,
-                          test_nmr: np.ndarray,
-                          test_ir: np.ndarray,
-                          test_targets: np.ndarray,
-                          val_nmr: Optional[np.ndarray] = None,
-                          val_ir: Optional[np.ndarray] = None,
-                          val_targets: Optional[np.ndarray] = None) -> Dict[str, DataLoader]:
-        """
-        Create PyTorch DataLoaders from spectral data.
-        
-        Args:
-            train_nmr: Training NMR data
-            train_ir: Training IR data
-            train_targets: Training targets
-            test_nmr: Test NMR data
-            test_ir: Test IR data
-            test_targets: Test targets
-            val_nmr: Validation NMR data (optional)
-            val_ir: Validation IR data (optional)
-            val_targets: Validation targets (optional)
-        
-        Returns:
-            Dictionary with 'train', 'validation', 'test' DataLoaders
-        """
-        try:
-            logging.info("\n" + "=" * 60)
-            logging.info("CREATING PYTORCH DATALOADERS")
-            logging.info("=" * 60)
-            
-            dataloaders = {}
-            
-            # Training dataloader
-            train_dataset = SpectralDataset(
-                nmr_spectra=train_nmr,
-                ir_spectra=train_ir,
-                targets=train_targets,
-                target_type=self.target_type
-            )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.batch_size,
-                shuffle=self.shuffle_train,
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory
-            )
-            dataloaders['train'] = train_loader
-            logging.info(f"  Train: {len(train_dataset)} samples, {len(train_loader)} batches")
-            
-            # Test dataloader
-            test_dataset = SpectralDataset(
-                nmr_spectra=test_nmr,
-                ir_spectra=test_ir,
-                targets=test_targets,
-                target_type=self.target_type
-            )
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory
-            )
-            dataloaders['test'] = test_loader
-            logging.info(f"  Test: {len(test_dataset)} samples, {len(test_loader)} batches")
-            
-            # Validation dataloader if available
-            if val_nmr is not None:
-                val_dataset = SpectralDataset(
-                    nmr_spectra=val_nmr,
-                    ir_spectra=val_ir,
-                    targets=val_targets,
-                    target_type=self.target_type
-                )
-                val_loader = DataLoader(
-                    val_dataset,
-                    batch_size=self.batch_size,
-                    shuffle=False,
-                    num_workers=self.num_workers,
-                    pin_memory=self.pin_memory
-                )
-                dataloaders['validation'] = val_loader
-                logging.info(f"  Validation: {len(val_dataset)} samples, {len(val_loader)} batches")
-            
-            logging.info("=" * 60)
-            logging.info("✅ DATALOADERS CREATED SUCCESSFULLY!")
-            logging.info("=" * 60)
-            
-            return dataloaders
-            
-        except Exception as e:
-            raise CustomException(e, sys)
-
-
-if __name__ == "__main__":
-    try:
-        print("\n" + "=" * 60)
-        print("🧪 TESTING DATA TRANSFORMATION (NMR + IR)")
-        print("=" * 60)
-        
-        data_transformation = DataTransformation()
-        print("\n✅ Data transformation test completed!")
-        
-    except Exception as e:
-        raise CustomException(e, sys)
